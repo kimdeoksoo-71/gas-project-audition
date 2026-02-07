@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8" />
+
+  <!-- MathJax v3 -->
+  <script>
+    window.MathJax = {
+      tex: {
+        // 혼재된 구분자 대응
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        processEscapes: true
+      },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre'] }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+
+  <style>
+    :root{
+      --pad: 12px;
+      --border: 1px solid #ddd;
+      --font: 18px;
+      --lh: 1.8;
+    }
+    *{ box-sizing: border-box; }
+    body{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", Arial, sans-serif;
+      font-size: var(--font);
+      line-height: var(--lh);
+      color: #111;
+      background: #fff;
+      overflow: hidden;
+    }
+    .wrap{
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .topbar{
+      border-bottom: var(--border);
+      padding: var(--pad);
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+      min-width: 0;
+    }
+    .left{
+      min-width: 0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      align-items: center;
+    }
+    .pill{
+      background: #f5f5f5;
+      border: 1px solid #e2e2e2;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-weight: 700;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .a1box{
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+    }
+    input{
+      width: 120px;
+      font-size: 15px;
+      padding: 7px 10px;
+      border: 1px solid #bbb;
+      border-radius: 8px;
+      outline: none;
+    }
+    button{
+      font-size: 14px;
+      padding: 8px 12px;
+      border: 1px solid #bbb;
+      background: #f7f7f7;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    button:disabled{ opacity: .45; cursor: default; }
+
+    .right{
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: center;
+    }
+
+    .content{
+      flex: 1;
+      min-height: 0;
+      padding: var(--pad);
+      overflow: auto;
+    }
+    .box{
+      border: var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      background: #fff;
+      white-space: pre-wrap; /* 줄바꿈 유지 */
+      word-break: break-word;
+      overflow-x: auto;       /* 긴 수식은 가로 스크롤 */
+      min-width: 0;
+    }
+    mjx-container{
+      max-width: 100% !important;
+      overflow-x: auto;
+      overflow-y: hidden;
+    }
+
+    .footer{
+      border-top: var(--border);
+      padding: 10px var(--pad);
+      color: #555;
+      font-size: 13px;
+      background: #fcfcfc;
+    }
+    .kbd{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      background: #eee;
+      border: 1px solid #ddd;
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+    .muted{ color:#666; }
+  </style>
+</head>
+
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="left">
+      <div class="pill" id="sheetName">Sheet</div>
+      <div class="pill" id="cellInfo">A1</div>
+
+      <div class="a1box">
+        <span class="muted">이동:</span>
+        <input id="a1Input" placeholder="예: B7" />
+        <button onclick="doGoto()">Go</button>
+      </div>
+    </div>
+
+    <div class="right">
+      <button onclick="move(0,-1)">이전(←)</button>
+      <button onclick="move(0, 1)">다음(→)</button>
+      <button onclick="refresh()">새로고침</button>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="box" id="viewer">불러오는 중...</div>
+  </div>
+
+  <div class="footer">
+    단축키: <span class="kbd">↑</span><span class="kbd">↓</span><span class="kbd">←</span><span class="kbd">→</span>
+    <span class="muted"> (활성 셀 이동)</span>
+  </div>
+</div>
+
+<script>
+  function setText(id, text){
+    document.getElementById(id).textContent = text ?? "";
+  }
+
+  async function typeset(){
+    if (window.MathJax?.typesetPromise) {
+      if (MathJax.typesetClear) MathJax.typesetClear();
+      await MathJax.typesetPromise();
+    }
+  }
+
+  function renderCell(data){
+    setText("sheetName", data.sheetName || "");
+    setText("cellInfo", `${data.a1 || ""}  (R${data.row}, C${data.col})`);
+
+    const viewer = document.getElementById("viewer");
+    viewer.textContent = data.text ?? ""; // ✅ innerHTML 금지
+    typeset();
+  }
+
+  function refresh(){
+    google.script.run
+      .withSuccessHandler(renderCell)
+      .withFailureHandler(err => {
+        document.getElementById("viewer").textContent = "ERROR: " + (err?.message || err);
+      })
+      .lv_getActiveCellContent();
+  }
+
+  function doGoto(){
+    const a1 = (document.getElementById("a1Input").value || "").trim();
+    if (!a1) return;
+    google.script.run
+      .withSuccessHandler(renderCell)
+      .withFailureHandler(err => alert(err?.message || err))
+      .lv_gotoA1(a1);
+  }
+
+  function move(dr, dc){
+    google.script.run
+      .withSuccessHandler(renderCell)
+      .withFailureHandler(err => alert(err?.message || err))
+      .lv_move(dr, dc);
+  }
+
+  // Enter로 이동
+  document.getElementById("a1Input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doGoto();
+  });
+
+  // 방향키로 이동
+  window.addEventListener("keydown", (e) => {
+    // 입력창에서 방향키 누를 땐 이동 막기(커서 이동 우선)
+    const active = document.activeElement;
+    if (active && active.id === "a1Input") return;
+
+    if (e.key === "ArrowUp")    { e.preventDefault(); move(-1, 0); }
+    if (e.key === "ArrowDown")  { e.preventDefault(); move( 1, 0); }
+    if (e.key === "ArrowLeft")  { e.preventDefault(); move( 0,-1); }
+    if (e.key === "ArrowRight") { e.preventDefault(); move( 0, 1); }
+  });
+
+  // 최초 로드
+  refresh();
+</script>
+</body>
+</html>

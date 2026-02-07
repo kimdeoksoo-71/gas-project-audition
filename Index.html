@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <script>
+      MathJax = {
+        tex: {
+          inlineMath: [['$', '$'], ['\\(', '\\)']]
+        },
+        svg: {
+          fontCache: 'global'
+        }
+      };
+    </script>
+    <script type="text/javascript" id="MathJax-script" async
+      src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js">
+    </script>
+
+    <style>
+      /* * [수정됨] 
+       * 기본 글자 크기 14pt, 줄 간격 1.8배 적용 
+       */
+      body { 
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+        margin: 0; 
+        padding: 0; 
+        display: flex; 
+        flex-direction: column; 
+        height: 100vh; 
+        overflow: hidden;
+        font-size: 14pt; /* 요청사항: 글자 크기 */
+        line-height: 1.8; /* 요청사항: 줄 간격 */
+        color: #333; /* 글자색을 진한 회색으로 하여 눈의 피로 감소 */
+      }
+      
+      /* 초기 입력 화면 스타일 */
+      #input-screen {
+        display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background-color: #f0f2f5;
+      }
+      .input-box {
+        background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); text-align: center;
+      }
+      input[type="number"] { padding: 12px; margin: 5px; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; }
+      button { padding: 12px 24px; background-color: #4285f4; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold; }
+      button:hover { background-color: #357abd; }
+      
+      /* 뷰어 화면 스타일 */
+      #viewer-screen { display: none; flex-direction: column; height: 100%; }
+      
+      /* 헤더 */
+      header {
+        background-color: #2c3e50; color: white; padding: 0 20px; display: flex; justify-content: space-between; align-items: center; height: 60px; flex-shrink: 0; font-size: 16px;
+      }
+      #header-title { font-weight: bold; }
+      .nav-buttons button { background-color: #555; margin-left: 8px; font-size: 14px; padding: 8px 16px; }
+      .nav-buttons button:disabled { opacity: 0.5; cursor: not-allowed; }
+      
+      /* 본문 (2분할 패널) */
+      #main-container { display: flex; flex: 1; overflow: hidden; }
+      .panel { 
+        flex: 1; 
+        padding: 30px; /* 패딩을 좀 더 넓게 */
+        overflow-y: auto; 
+        border-right: 1px solid #e0e0e0; 
+        display: flex; 
+        flex-direction: column; 
+        gap: 30px; /* 섹션 간 간격 넓힘 */
+      }
+      .panel:last-child { border-right: none; background-color: #fafafa; }
+      
+      /* 데이터 항목 스타일 */
+      .section { 
+        border: 1px solid #e0e0e0; 
+        padding: 20px; 
+        border-radius: 8px; 
+        background: white; 
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+      }
+      
+      .label { 
+        font-weight: bold; 
+        color: #2c3e50; 
+        display: block; 
+        margin-bottom: 10px; 
+        font-size: 16px; /* 라벨은 본문보다 조금 더 명확하게 */
+        border-bottom: 2px solid #f0f0f0; 
+        padding-bottom: 5px; 
+      }
+      
+      /* 본문 내용 스타일 강화 */
+      .content { 
+        font-size: 14pt; /* 명시적 지정 */
+        line-height: 1.8; /* 명시적 지정 */
+        word-wrap: break-word; /* 긴 수식이나 단어 줄바꿈 */
+      }
+      
+      /* 에러 강조 */
+      .status-badge { display: inline-block; padding: 4px 12px; border-radius: 15px; font-size: 14px; font-weight: bold; color: white; background-color: #888; line-height: 1.2; }
+      .status-error { background-color: #d93025; } 
+      .status-ok { background-color: #188038; }   
+      
+      /* 로딩 인디케이터 */
+      #loader { display: none; color: #666; margin-top: 15px; font-size: 16px; }
+    </style>
+  </head>
+  <body>
+
+    <div id="input-screen">
+      <div class="input-box">
+        <h2 style="margin-top:0;">검토할 행 범위 입력</h2>
+        <input type="number" id="startRow" placeholder="시작 행 (예: 2)" value="2">
+        <input type="number" id="endRow" placeholder="종료 행 (예: 100)">
+        <br><br>
+        <button onclick="loadData()">조회 시작</button>
+        <div id="loader">데이터를 불러오는 중...</div>
+      </div>
+    </div>
+
+    <div id="viewer-screen">
+      <header>
+        <div id="header-title">Loading...</div> 
+        <div class="nav-buttons"> 
+          <span id="page-info" style="margin-right: 15px; font-weight:bold;"></span>
+          <button id="btn-prev" onclick="navigate(-1)">Prev</button>
+          <button id="btn-next" onclick="navigate(1)">Next</button>
+          <button onclick="google.script.host.close()" style="background-color:#d93025">Close</button>
+        </div>
+      </header>
+      
+      <div id="main-container">
+        <div class="panel" id="left-panel">
+          <div class="section">
+            <span class="label">문제 오류 판정 (N)</span>
+            <span id="val-n-status" class="status-badge"></span>
+          </div>
+          <div class="section">
+            <span class="label">문제 (E)</span>
+            <div id="val-problem" class="content"></div>
+          </div>
+          <div class="section">
+            <span class="label">문제 풀이 노트 (P)</span>
+            <div id="val-p-note" class="content"></div>
+          </div>
+        </div>
+
+        <div class="panel" id="right-panel">
+          <div class="section">
+            <span class="label">풀이 오류 판정 (Q)</span>
+            <span id="val-q-status" class="status-badge"></span>
+          </div>
+          <div class="section">
+            <span class="label">풀이 (C)</span>
+            <div id="val-solution" class="content"></div>
+          </div>
+          <div class="section">
+            <span class="label">오류 내용 (R)</span>
+            <div id="val-r-error" class="content"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      var errorData = [];
+      var currentIndex = 0;
+
+      function loadData() {
+        var start = document.getElementById('startRow').value;
+        var end = document.getElementById('endRow').value;
+
+        if (!start || !end) {
+          alert("시작 행과 종료 행을 모두 입력해주세요.");
+          return;
+        }
+
+        document.getElementById('loader').style.display = 'block';
+
+        google.script.run
+          .withSuccessHandler(onSuccess)
+          .withFailureHandler(onFailure)
+          .getErrorData(parseInt(start), parseInt(end));
+      }
+
+      function onSuccess(data) {
+        document.getElementById('loader').style.display = 'none';
+        
+        if (data.length === 0) {
+          alert("해당 범위 내에 오류(error)로 표시된 항목이 없습니다.");
+          return;
+        }
+
+        errorData = data;
+        currentIndex = 0;
+        
+        document.getElementById('input-screen').style.display = 'none';
+        document.getElementById('viewer-screen').style.display = 'flex';
+        
+        renderCurrent();
+      }
+
+      function onFailure(error) {
+        document.getElementById('loader').style.display = 'none';
+        alert("오류 발생: " + error.message);
+      }
+
+      function renderCurrent() {
+        var item = errorData[currentIndex];
+
+        document.getElementById('header-title').textContent = "출처: " + item.source + " (Row: " + item.rowIndex + ")";
+        document.getElementById('page-info').textContent = (currentIndex + 1) + " / " + errorData.length;
+
+        document.getElementById('btn-prev').disabled = (currentIndex === 0);
+        document.getElementById('btn-next').disabled = (currentIndex === errorData.length - 1);
+
+        setStatus('val-n-status', item.n_status);
+        document.getElementById('val-problem').innerHTML = item.problem; 
+        document.getElementById('val-p-note').innerHTML = item.p_note;
+
+        setStatus('val-q-status', item.q_status);
+        document.getElementById('val-solution').innerHTML = item.solution;
+        document.getElementById('val-r-error').innerHTML = item.r_error;
+
+        if (window.MathJax) {
+          MathJax.typesetPromise().catch(function (err) { console.log('MathJax Error:', err); });
+        }
+      }
+
+      function setStatus(elementId, statusText) {
+        var el = document.getElementById(elementId);
+        el.textContent = statusText;
+        el.className = 'status-badge'; 
+        
+        var s = String(statusText).trim().toLowerCase();
+        if (s === 'error') {
+          el.classList.add('status-error');
+        } else if (s === 'ok') {
+          el.classList.add('status-ok');
+        }
+      }
+
+      function navigate(direction) {
+        var newIndex = currentIndex + direction;
+        if (newIndex >= 0 && newIndex < errorData.length) {
+          currentIndex = newIndex;
+          renderCurrent();
+        }
+      }
+    </script>
+  </body>
+</html>

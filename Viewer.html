@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top" />
+  <meta charset="utf-8" />
+
+  <script>
+    const PAYLOAD = JSON.parse(<?= payloadJson ?>);
+  </script>
+
+  <!-- MathJax v3: delimiter를 \( \), \[ \]로만 -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        processEscapes: true
+      },
+      options: {
+        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre']
+      }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+
+  <style>
+    :root{
+      --fontSize: 16pt;
+      --lineHeight: 1.8;
+      --border: 1px solid #ddd;
+      --pad: 14px;
+      --soft: #fafafa;
+    }
+    *{ box-sizing: border-box; }
+
+    body{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", Arial, sans-serif;
+      font-size: var(--fontSize);
+      line-height: var(--lineHeight);
+      background: #fff;
+      color: #111;
+      overflow: hidden;
+    }
+
+    .wrap{
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .topbar{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px var(--pad);
+      border-bottom: var(--border);
+      gap: 12px;
+      min-width: 0;
+    }
+    .idbox{
+      font-weight: 700;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 70%;
+      min-width: 0;
+    }
+    .btns{ display: flex; gap: 10px; }
+    button{
+      font-size: 14pt;
+      padding: 8px 14px;
+      border: 1px solid #bbb;
+      background: #f7f7f7;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    button:disabled{ opacity: 0.4; cursor: default; }
+
+    .main{
+      flex: 1;
+      display: flex;
+      min-height: 0;
+      min-width: 0;
+      width: 100%;
+    }
+    .panel{
+      flex: 0 0 50%;
+      width: 50%;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      border-right: var(--border);
+      min-height: 0;
+    }
+    .panel.right{ border-right: none; }
+
+    .section{
+      padding: 10px var(--pad);
+      border-bottom: var(--border);
+      font-weight: 800;
+      background: var(--soft);
+      flex: 0 0 auto;
+    }
+
+    .content{
+      padding: var(--pad);
+      overflow: auto;
+      min-height: 0;
+      min-width: 0;
+    }
+
+    .field{ margin-bottom: 18px; }
+    .label{
+      font-weight: 800;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .box{
+      border: var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      background: #fff;
+      white-space: pre-wrap;
+      overflow-x: auto;
+      min-width: 0;
+      max-width: 100%;
+    }
+
+    mjx-container{
+      max-width: 100% !important;
+      overflow-x: auto;
+      overflow-y: hidden;
+    }
+    mjx-container[jax="CHTML"][display="true"]{
+      display: block;
+      max-width: 100% !important;
+      overflow-x: auto;
+    }
+
+    .badge{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-weight: 900;
+      font-size: 13pt;
+      border: 1px solid transparent;
+      line-height: 1.2;
+      user-select: none;
+      flex: 0 0 auto;
+    }
+    .badge.ok{
+      color: #0b3d91;
+      background: #e8f0ff;
+      border-color: #b6d0ff;
+    }
+    .badge.error{
+      color: #b42318;
+      background: #ffeceb;
+      border-color: #ffb4ad;
+    }
+    .badge.skip{
+      color: #555;
+      background: #f2f2f2;
+      border-color: #ddd;
+    }
+    .badge.other{
+      color: #444;
+      background: #f2f2f2;
+      border-color: #ddd;
+    }
+
+    .meta{
+      font-size: 12pt;
+      color: #555;
+      padding: 8px var(--pad);
+      border-top: var(--border);
+      background: #fcfcfc;
+      flex: 0 0 auto;
+    }
+
+    /* JSON -> 카드 렌더 */
+    .cardlist{ display: flex; flex-direction: column; gap: 10px; }
+    .card{
+      border: 1px solid #e3e3e3;
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #fff;
+    }
+    .cardhead{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 6px;
+    }
+    .typepill{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 900;
+      font-size: 13pt;
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid #ddd;
+      background: #f7f7f7;
+      flex: 0 0 auto;
+    }
+    .kv{
+      white-space: pre-wrap;
+      overflow-x: auto;
+      border: 1px dashed #e0e0e0;
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: #fcfcfc;
+    }
+    .kv .k{ font-weight: 900; }
+    .muted{ color: #777; font-size: 13pt; }
+
+    details{ border: 1px solid #eee; border-radius: 12px; padding: 8px 10px; background: #fff; }
+    summary{ cursor: pointer; font-weight: 800; }
+    pre{
+      margin: 8px 0 0 0;
+      padding: 10px;
+      background: #111;
+      color: #eee;
+      border-radius: 10px;
+      overflow: auto;
+      font-size: 12pt;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="idbox" id="idbox"></div>
+      <div class="btns">
+        <button id="prevBtn" onclick="goPrev()">이전</button>
+        <button id="nextBtn" onclick="goNext()">다음</button>
+      </div>
+    </div>
+
+    <div class="main">
+      <!-- LEFT -->
+      <div class="panel left">
+        <div class="section">문제 검토</div>
+        <div class="content">
+          <div class="field">
+            <div class="label">
+              <span>N : verdict</span>
+              <span id="badge_problem" class="badge other">-</span>
+            </div>
+            <div class="box" id="left_verdict"></div>
+          </div>
+
+          <div class="field">
+            <div class="label">E : stem</div>
+            <div class="box" id="left_stem"></div>
+          </div>
+
+          <div class="field">
+            <div class="label">P : solution_note</div>
+            <div class="box" id="left_solution_note"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT -->
+      <div class="panel right">
+        <div class="section">해설 검토</div>
+        <div class="content">
+          <div class="field">
+            <div class="label">
+              <span>Q : final_verdict</span>
+              <span id="badge_solution" class="badge other">-</span>
+            </div>
+            <div class="box" id="right_final_verdict"></div>
+          </div>
+
+          <div class="field">
+            <div class="label">C : given_solution</div>
+            <div class="box" id="right_given_solution"></div>
+          </div>
+
+          <div class="field">
+            <div class="label">R : base_errors_json</div>
+            <div class="box" id="right_base_cards"></div>
+            <details style="margin-top:10px;">
+              <summary>원본 JSON 보기 (R)</summary>
+              <pre id="right_base_raw"></pre>
+            </details>
+          </div>
+
+          <div class="field">
+            <div class="label">S : logic_errors_json</div>
+            <div class="box" id="right_logic_cards"></div>
+            <details style="margin-top:10px;">
+              <summary>원본 JSON 보기 (S)</summary>
+              <pre id="right_logic_raw"></pre>
+            </details>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="meta" id="meta"></div>
+  </div>
+
+<script>
+  const items = PAYLOAD.items || [];
+  let idx = 0;
+
+  function norm(v){ return (v ?? "").toString().trim().toLowerCase(); }
+
+  function verdictLabel(v){
+    const s = norm(v);
+    if (s === "ok") return "OK";
+    if (s === "error") return "ERROR";
+    if (s === "skip") return "SKIP";
+    return (v ?? "").toString().trim() || "-";
+  }
+
+  function applyBadge(badgeId, v){
+    const el = document.getElementById(badgeId);
+    const s = norm(v);
+    el.classList.remove("ok", "error", "skip", "other");
+    if (s === "ok") {
+      el.classList.add("ok"); el.textContent = "OK";
+    } else if (s === "error") {
+      el.classList.add("error"); el.textContent = "ERROR";
+    } else if (s === "skip") {
+      el.classList.add("skip"); el.textContent = "SKIP";
+    } else {
+      el.classList.add("other"); el.textContent = verdictLabel(v);
+    }
+  }
+
+  // $ / $$ 를 \( \) / \[ \] 로 정규화
+  function normalizeMathDelimiters(text){
+    let s = (text ?? "").toString();
+    s = convertDollarMath_(s, true);   // $$..$$ -> \[..\]
+    s = convertDollarMath_(s, false);  // $..$   -> \(..\)
+    return s;
+  }
+
+  function convertDollarMath_(input, isDisplay){
+    const open = isDisplay ? "$$" : "$";
+    const close = isDisplay ? "$$" : "$";
+    const repOpen = isDisplay ? "\\[" : "\\(";
+    const repClose = isDisplay ? "\\]" : "\\)";
+
+    let out = "";
+    let i = 0;
+    let inMath = false;
+
+    while (i < input.length) {
+      if (input[i] === "\\" && input[i+1] === "$") {
+        out += "\\$";
+        i += 2;
+        continue;
+      }
+
+      if (!inMath && input.startsWith(open, i)) {
+        if (!isDisplay && input.startsWith("$$", i)) {
+          out += "$$";
+          i += 2;
+          continue;
+        }
+        out += repOpen;
+        i += open.length;
+        inMath = true;
+        continue;
+      }
+
+      if (inMath && input.startsWith(close, i)) {
+        out += repClose;
+        i += close.length;
+        inMath = false;
+        continue;
+      }
+
+      out += input[i];
+      i += 1;
+    }
+    return out;
+  }
+
+  function setBoxText(elId, text){
+    const el = document.getElementById(elId);
+    el.textContent = normalizeMathDelimiters(text);
+  }
+
+  function setPreText(elId, text){
+    const el = document.getElementById(elId);
+    el.textContent = (text ?? "").toString();
+  }
+
+  function safeParseArray(jsonText){
+    const raw = (jsonText ?? "").toString().trim();
+    if (!raw) return { ok:true, arr:[], raw:"" };
+    try {
+      const v = JSON.parse(raw);
+      if (Array.isArray(v)) return { ok:true, arr:v, raw:raw };
+      return { ok:false, arr:[], raw:raw, msg:"JSON은 맞는데 배열이 아님" };
+    } catch(e) {
+      return { ok:false, arr:[], raw:raw, msg:"JSON 파싱 실패" };
+    }
+  }
+
+  function renderErrorCards(containerId, rawPreId, jsonText){
+    const box = document.getElementById(containerId);
+    const parsed = safeParseArray(jsonText);
+
+    // 원본 JSON
+    setPreText(rawPreId, parsed.raw);
+
+    // 카드 렌더
+    if (parsed.ok && parsed.arr.length === 0) {
+      box.innerHTML = `<div class="muted">(오류 없음: [])</div>`;
+      return;
+    }
+
+    if (!parsed.ok) {
+      box.innerHTML = `<div class="muted">(${parsed.msg})</div>`;
+      return;
+    }
+
+    // items
+    const cards = parsed.arr.map((it, k) => {
+      const type = (it?.type ?? "").toString();
+      const error = normalizeMathDelimiters((it?.error ?? "").toString());
+      const fix = normalizeMathDelimiters((it?.fix ?? "").toString());
+
+      return `
+        <div class="card">
+          <div class="cardhead">
+            <span class="typepill">${escapeHtml(type || "?" )}</span>
+            <span class="muted">#${k+1}</span>
+          </div>
+          <div class="kv"><span class="k">error</span>\n${escapeHtml(error)}</div>
+          <div style="height:8px"></div>
+          <div class="kv"><span class="k">fix</span>\n${escapeHtml(fix)}</div>
+        </div>
+      `;
+    }).join("");
+
+    box.innerHTML = `<div class="cardlist">${cards}</div>`;
+  }
+
+  function escapeHtml(s){
+    return (s ?? "").toString()
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  async function renderMath(){
+    if (window.MathJax && MathJax.typesetPromise) {
+      if (MathJax.typesetClear) MathJax.typesetClear();
+      await MathJax.typesetPromise();
+    }
+  }
+
+  async function show(i){
+    if (i < 0 || i >= items.length) return;
+    idx = i;
+
+    const it = items[idx];
+
+    document.getElementById("idbox").textContent = `A : ${it.id || ""}   (row ${it.sheetRow})`;
+
+    // LEFT (문항)
+    setBoxText("left_verdict", verdictLabel(it.verdict));
+    applyBadge("badge_problem", it.verdict);
+    setBoxText("left_stem", it.stem);
+    setBoxText("left_solution_note", it.solution_note);
+
+    // RIGHT (해설)
+    setBoxText("right_final_verdict", verdictLabel(it.final_verdict));
+    applyBadge("badge_solution", it.final_verdict);
+
+    setBoxText("right_given_solution", it.given_solution);
+
+    renderErrorCards("right_base_cards", "right_base_raw", it.base_json);
+    renderErrorCards("right_logic_cards", "right_logic_raw", it.logic_json);
+
+    document.getElementById("prevBtn").disabled = (idx === 0);
+    document.getElementById("nextBtn").disabled = (idx === items.length - 1);
+
+    document.getElementById("meta").textContent =
+      `대상: ${items.length}개 | 현재: ${idx+1}/${items.length} (←/→ 가능)`;
+
+    await renderMath();
+  }
+
+  function goPrev(){ show(idx - 1); }
+  function goNext(){ show(idx + 1); }
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft") goPrev();
+    if (e.key === "ArrowRight") goNext();
+  });
+
+  show(0);
+</script>
+</body>
+</html>
