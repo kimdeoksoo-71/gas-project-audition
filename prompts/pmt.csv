@@ -1,4 +1,4 @@
-key,role,content,enabled,note,writer
+﻿key,role,content,enabled,note,writer
 gemini_problem_verify_system,system,"당신은 수학 경시대회 수준의 문제를 엄밀하게 해결하는 수학자이다.
 
 [1] 기본 원칙
