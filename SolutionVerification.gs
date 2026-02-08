@@ -2,11 +2,11 @@
  * Dual Engine Runner
  ***********************/
 const SHEET_NAME_DATA = 'Data_DS';
-const SHEET_NAME_PROMPT = 'prompt';
+const SHEET_NAME_PROMPT = 'pmt';  // ✅ 'prompt' → 'pmt'로 변경
 
 // ✅ prompt key 분리
-const PROMPT_KEY_GPT = 'solution_verify_gpt';
-const PROMPT_KEY_GEMINI = 'solution_verify_gemini';
+const PROMPT_KEY_GPT = 'gpt_solution_verify';      // ✅ '_system' 제거
+const PROMPT_KEY_GEMINI = 'gemini_solution_verify'; // ✅ '_system' 제거
 
 // ✅ 상태키
 const PROP_CURRENT_ROW = 'AUTO_CURRENT_ROW';
@@ -67,15 +67,6 @@ function startAutomaticProcess_(provider) {
   mainLoop();
 }
 
-function forceStopProcess() {
-  const props = PropertiesService.getScriptProperties();
-  props.setProperty(PROP_STOP_SIGNAL, 'true');
-  props.deleteProperty(PROP_RUNNING);
-  props.deleteProperty(PROP_LAST_TRIGGER_TIME);
-  props.deleteProperty(PROP_PROVIDER);
-  deleteAllTriggers();
-  SpreadsheetApp.getActiveSpreadsheet().toast('작업을 완전히 중단했습니다.', '중단 알림');
-}
 
 function mainLoop() {
   const lock = LockService.getScriptLock();
@@ -100,10 +91,13 @@ function mainLoop() {
   try {
     const provider = (props.getProperty(PROP_PROVIDER) || 'gpt').toLowerCase();
     const promptKey = provider === 'gemini' ? PROMPT_KEY_GEMINI : PROMPT_KEY_GPT;
-    const systemPrompt = getSystemPromptByKey_(ss, promptKey);
-
-    if (!systemPrompt) {
+    
+    // ✅ system, user, assistant 프롬프트를 모두 가져옴
+    const prompts = getPromptsByKey_(ss, promptKey);
+    
+    if (!prompts || !prompts.system) {
       props.deleteProperty(PROP_RUNNING);
+      ss.toast('프롬프트를 찾을 수 없습니다.', '오류');
       return;
     }
 
@@ -129,8 +123,8 @@ function mainLoop() {
 
       if (problem && solution) {
         const result = (provider === 'gemini')
-          ? callGemini_(systemPrompt, problem, solution)
-          : callOpenAI_(systemPrompt, problem, solution);
+          ? callGemini_(prompts, problem, solution)
+          : callOpenAI_(prompts, problem, solution);
 
         sheet.getRange(currentRow, 17, 1, 2).setValues([[result.verdict, result.error_report]]);
       } else {
@@ -174,15 +168,28 @@ function mainLoop() {
 /***************
  * Provider Calls
  ***************/
-function callOpenAI_(systemPrompt, problem, solution) {
+function callOpenAI_(prompts, problem, solution) {
+  // ✅ system, user, assistant 프롬프트를 messages에 배열로 구성
+  const messages = [
+    { role: "system", content: prompts.system }
+  ];
+  
+  // user 프롬프트에 {problem}과 {solution} 플레이스홀더 치환
+  const userContent = (prompts.user || '')
+    .replace(/\{problem\}/g, problem)
+    .replace(/\{solution\}/g, solution);
+  messages.push({ role: "user", content: userContent });
+  
+  // assistant 프롬프트가 있으면 추가 (옵션)
+  if (prompts.assistant) {
+    messages.push({ role: "assistant", content: prompts.assistant });
+  }
+
   const payload = {
     model: OPENAI_MODEL,
     store: false,
     reasoning: { effort: "none" },
-    input: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: `[문제]\n${problem}\n\n[풀이]\n${solution}` }
-    ],
+    input: messages,
     text: {
       format: {
         type: "json_schema",
@@ -192,7 +199,7 @@ function callOpenAI_(systemPrompt, problem, solution) {
           type: "object",
           additionalProperties: false,
           properties: {
-            verdict: { type: "string", enum: ["ok", "error", "check"] },
+            verdict: { type: "string", enum: ["ok", "error", "check", "skip"] },
             error_report: { type: "string" }
           },
           required: ["verdict", "error_report"]
@@ -236,11 +243,22 @@ function extractResponseText_(resObj) {
   return "";
 }
 
-function callGemini_(systemPrompt, problem, solution) {
+function callGemini_(prompts, problem, solution) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  
+  // ✅ user 프롬프트에 {problem}과 {solution} 플레이스홀더 치환
+  let userContent = (prompts.user || '')
+    .replace(/\{problem\}/g, problem)
+    .replace(/\{solution\}/g, solution);
+  
+  // ✅ assistant 프롬프트가 있으면 user 프롬프트 뒤에 붙임
+  if (prompts.assistant) {
+    userContent += '\n\n' + prompts.assistant;
+  }
+  
   const payload = {
-    system_instruction: { parts: [{ text: systemPrompt }] },
-    contents: [{ parts: [{ text: `[문제]\n${problem}\n[풀이]\n${solution}` }] }],
+    system_instruction: { parts: [{ text: prompts.system }] },
+    contents: [{ parts: [{ text: userContent }] }],
     generationConfig: { response_mime_type: "application/json", temperature: 0.1 }
   };
 
@@ -277,16 +295,46 @@ function deleteAllTriggers() {
   }
 }
 
-function getSystemPromptByKey_(ss, key) {
+/**
+ * ✅ 새로운 함수: key prefix에 해당하는 system, user, assistant 프롬프트를 모두 가져옴
+ * @param {SpreadsheetApp.Spreadsheet} ss
+ * @param {string} keyPrefix - 'gpt_solution_verify' 또는 'gemini_solution_verify'
+ * @return {Object|null} { system: string, user: string, assistant: string }
+ */
+function getPromptsByKey_(ss, keyPrefix) {
   const sheet = ss.getSheetByName(SHEET_NAME_PROMPT);
   if (!sheet) return null;
+  
   const data = sheet.getDataRange().getValues();
+  const prompts = {
+    system: '',
+    user: '',
+    assistant: ''
+  };
+  
+  // 헤더 행 제외하고 검색 (row 0은 헤더)
   for (let i = 1; i < data.length; i++) {
-    const k = String(data[i][0]).trim();
-    const enabled = (data[i][2] === true || String(data[i][2]).toUpperCase() === 'TRUE');
-    if (k === key && enabled) return data[i][1];
+    const key = String(data[i][0]).trim();      // A열: key
+    const role = String(data[i][1]).trim();     // B열: role
+    const content = String(data[i][2]);         // C열: content
+    const enabled = (data[i][3] === true || String(data[i][3]).toUpperCase() === 'TRUE' || data[i][3] === 1);  // D열: enabled
+    
+    // key가 일치하고 enabled가 true인 경우만
+    if (key.startsWith(keyPrefix) && enabled) {
+      if (key === keyPrefix + '_system' && role === 'system') {
+        prompts.system = content;
+      } else if (key === keyPrefix + '_user' && role === 'user') {
+        prompts.user = content;
+      } else if (key === keyPrefix + '_assistant' && role === 'assistant') {
+        prompts.assistant = content;
+      }
+    }
   }
-  return null;
+  
+  // system은 필수
+  if (!prompts.system) return null;
+  
+  return prompts;
 }
 
 function parseRowRange(text) {

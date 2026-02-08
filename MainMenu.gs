@@ -16,10 +16,14 @@ function onOpen() {
   const subMenuA = ui.createMenu('검토')
     .addItem('⏺️ 문항 정규화', 'ds_runNormalizeAndValidate_byRowInput')
     .addSeparator()
-    .addItem('▶️ 문제 검증', 'startValidationUI')
-    .addItem('▶️ 해설 검증 Gpt', 'startProcessGPT')
-    .addItem('▶️ 해설 검증 Gemini', 'startProcessGemini')
-    .addItem('⏹️ 해설 검증 강제중단', 'forceStopProcess');
+    .addItem('▶️ 문제검증 GPT', 'runWithGpt')
+    .addItem('▶️ 문제검증 Gemini', 'runWithGemini')
+    .addSeparator()
+    .addItem('▶️ 해설검증 GPT', 'startProcessGPT')
+    .addItem('▶️ 해설검증 Gemini', 'startProcessGemini')
+    .addSeparator()
+    .addItem('✅ 진행 상황 확인 (자동 감지)', 'checkProgressAuto')
+    .addItem('⛔ 강제 중단 (전체)', 'forceStopAll')
 
   // 5. 서브메뉴 B
   const subMenuB = ui.createMenu('Latex 변환')
