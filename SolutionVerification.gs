@@ -65,6 +65,7 @@ function startAutomaticProcess_(provider) {
   });
 
   ss.toast(`${range.startRow}행부터 자동 검수 시작 (${provider.toUpperCase()})`, '자동화 시작');
+  startWatchdog();  // ✅ 워치독 자동 시작
   mainLoop();
 }
 
@@ -160,6 +161,7 @@ function mainLoop() {
 
     if (!shouldContinue) {
       ss.toast('모든 검수가 완료되었습니다.', '완료');
+      stopWatchdog();  // ✅ 워치독 자동 종료
       props.deleteProperty(PROP_CURRENT_ROW);
       props.deleteProperty(PROP_END_ROW);
       props.deleteProperty(PROP_RUNNING);
