@@ -4,8 +4,9 @@ function onOpen() {
   const mainMenu = ui.createMenu('🥝 앱메뉴');
 
   // 2. 단일 항목
-  mainMenu.addItem('선택셀 보기', 'lv_openDialog');
   mainMenu.addItem('오류 보기', 'openErrorViewer');
+  mainMenu.addItem('선택셀 팝업창 보기', 'lv_openDialog');
+  mainMenu.addItem('선택셀 사이드바 보기','showCellPreviewSidebar')
 
   // 3. 구분선 + 기타
   mainMenu.addSeparator();
@@ -26,6 +27,8 @@ function onOpen() {
     .addItem('▶️ 해설검증 Gemini', 'startProcessGemini')
     .addItem('✅ 진행 상황 확인 (자동 감지)', 'checkProgressAuto')
     .addItem('⛔ 강제 중단 (전체)', 'forceStopAll')
+    .addSeparator()
+    .addItem('프롬프트를 github에 푸시', 'pushPromptCsvToGithub');
 
   // 5. 서브메뉴 B
   const subMenuB = ui.createMenu('Latex 변환')
