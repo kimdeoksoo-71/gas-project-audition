@@ -7,6 +7,7 @@
  *   - "문제검증"과 "해설검증"을 "문항 검증(문제+해설)"로 통합
  *   - "처리결과 Stack에 저장" 추가
  *   - parseRowRange를 여기서만 정의 (중복 제거)
+ *   - v2: "🔄 Error 행 재검증" 메뉴 추가
  * ============================================================
  */
 
@@ -23,11 +24,12 @@ function onOpen() {
   mainMenu.addItem('첫번째 셀로 합치기', 'mergeSelectedCellsToTopAndClearRest');
   mainMenu.addSeparator();
 
-  // ── 서브메뉴: 검토 (개편) ──
+  // ── 서브메뉴: 검토 (개편 v2) ──
   const subMenuA = ui.createMenu('검토')
     .addItem('⏺️ 문항 정규화', 'ds_runNormalizeAndValidate_byRowInput')
     .addSeparator()
     .addItem('▶️ 문항 검증 (문제+해설)', 'startItemVerification')
+    .addItem('🔄 Error 행 재검증', 'retryErrorRows')
     .addItem('✅ 진행 상태 확인', 'checkVerificationStatus')
     .addItem('🧪 단일 행 테스트', 'testSingleRowVerification')
     .addItem('⛔ 작업 중단', 'stopItemVerification')

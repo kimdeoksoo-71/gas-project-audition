@@ -17,15 +17,15 @@ const VCONFIG = {
   PMT_SHEET:  'pmt',
 
   GEMINI_MODEL: 'gemini-2.5-pro',
-  TEMPERATURE:  0.0,
+  TEMPERATURE:  0.1,
 
   MAX_EXEC_MS:    1000 * 60 * 3.5,   // 3.5분
-  MAX_RETRIES:    3,
+  MAX_RETRIES:    2,
   RETRY_DELAY_MS: 2000,
 
-  INITIAL_BATCH: 10,   // 문제+해설 2회 호출이므로 기존(20)의 절반
-  MIN_BATCH:     3,
-  MAX_BATCH:     25,
+  INITIAL_BATCH: 5,    // 2.5-pro + thinking 감안, 안전하게 축소
+  MIN_BATCH:     2,
+  MAX_BATCH:     15,
 
   /* Data_DS 열 번호 */
   COL: {
