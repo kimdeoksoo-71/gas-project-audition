@@ -9,6 +9,12 @@
  *
  * 대체 파일: ProblemVerification.gs, SolutionVerification.gs
  * ============================================================
+ * v3 변경사항 (2026-05):
+ *   - Lazy Watchdog: 메뉴 액션 시 이전 작업 멈춤 감지 (20분 임계)
+ *   - Time Budget: 한 행/한 재시도가 GAS 6분 한도 초과 못 하게 제한
+ *   - retryErrorRows: 'error' 또는 'timeout' 행만 골라서 재검증
+ *   - V_LAST_HEARTBEAT 키로 진척 시각 추적
+ * ============================================================
  */
 
 /* ─── 설정 ─── */
@@ -27,6 +33,11 @@ const VCONFIG = {
   MIN_BATCH:     2,
   MAX_BATCH:     15,
 
+  /* v3: 워치독/시간예산 설정 */
+  WATCHDOG_STALE_MIN:  20,        // 20분 무진척 → 멈춤 판정
+  ROW_TIME_RESERVE_MS: 90000,     // 한 행 처리에 최소 확보할 시간(90초)
+  API_CALL_RESERVE_MS: 65000,     // API 한 번 호출에 필요한 시간(60s+여유)
+
   /* Data_DS 열 번호 */
   COL: {
     STEM:        5,    // E  정규화된 문제
@@ -37,16 +48,18 @@ const VCONFIG = {
     P_NOTE:      16,   // P  solution_note
     S_VERDICT:   17,   // Q  해설검증 verdict
     S_ERROR:     18,   // R  error_report
+    THINKING_TOKENS: 19, // S  STEP1 thinking 토큰 수 (난이도 지표)
   },
 
   /* ScriptProperties 키 (통합) */
   PROP: {
-    CURRENT: 'V_CURRENT_ROW',
-    END:     'V_END_ROW',
-    START:   'V_START_ROW',
-    STOP:    'V_STOP',
-    BATCH:   'V_BATCH_SIZE',
-    RUNNING: 'V_RUNNING',
+    CURRENT:   'V_CURRENT_ROW',
+    END:       'V_END_ROW',
+    START:     'V_START_ROW',
+    STOP:      'V_STOP',
+    BATCH:     'V_BATCH_SIZE',
+    RUNNING:   'V_RUNNING',
+    HEARTBEAT: 'V_LAST_HEARTBEAT',  // v3: 마지막 진척 시각(ms)
   },
 
   TRIGGER_FN: 'processVerificationQueue',
@@ -60,6 +73,12 @@ const VCONFIG = {
 /** 메뉴 호출: 통합 문항 검증 시작 */
 function startItemVerification() {
   const ui = SpreadsheetApp.getUi();
+
+  // ── v3: 이전 작업 멈춤 감지 (lazy watchdog) ──
+  const staleResult = checkAndHandleStaleRun_(ui);
+  if (staleResult === 'cancel' || staleResult === 'resumed') return;
+  // 'continue'이면 새 작업 진행
+
   const input = ui.prompt(
     '문항 검증 (문제 + 해설)',
     '검증할 행 범위를 입력하세요 (예: 2-100)',
@@ -80,12 +99,13 @@ function startItemVerification() {
 
   const props = PropertiesService.getScriptProperties();
   props.setProperties({
-    [VCONFIG.PROP.CURRENT]: String(range.startRow),
-    [VCONFIG.PROP.END]:     String(range.endRow),
-    [VCONFIG.PROP.START]:   String(range.startRow),
-    [VCONFIG.PROP.STOP]:    'false',
-    [VCONFIG.PROP.BATCH]:   String(VCONFIG.INITIAL_BATCH),
-    [VCONFIG.PROP.RUNNING]: 'true',
+    [VCONFIG.PROP.CURRENT]:   String(range.startRow),
+    [VCONFIG.PROP.END]:       String(range.endRow),
+    [VCONFIG.PROP.START]:     String(range.startRow),
+    [VCONFIG.PROP.STOP]:      'false',
+    [VCONFIG.PROP.BATCH]:     String(VCONFIG.INITIAL_BATCH),
+    [VCONFIG.PROP.RUNNING]:   'true',
+    [VCONFIG.PROP.HEARTBEAT]: String(Date.now()),  // v3: 시작 시 heartbeat
   });
 
   ui.alert(
@@ -104,25 +124,38 @@ function stopItemVerification() {
 
 /** 메뉴 호출: 진행 상태 확인 */
 function checkVerificationStatus() {
+  const ui = SpreadsheetApp.getUi();
   const props = PropertiesService.getScriptProperties();
+
+  // ── v3: 멈춤 감지 먼저 ──
+  const staleResult = checkAndHandleStaleRun_(ui);
+  if (staleResult === 'cancel' || staleResult === 'resumed') return;
+  // 'continue'이면 정상 상태 표시
+
   const current = parseInt(props.getProperty(VCONFIG.PROP.CURRENT), 10);
   const end     = parseInt(props.getProperty(VCONFIG.PROP.END), 10);
   const start   = parseInt(props.getProperty(VCONFIG.PROP.START), 10);
   const batch   = props.getProperty(VCONFIG.PROP.BATCH) || VCONFIG.INITIAL_BATCH;
   const running = props.getProperty(VCONFIG.PROP.RUNNING);
+  const heartbeat = parseInt(props.getProperty(VCONFIG.PROP.HEARTBEAT), 10);
 
   if (!current || !end || running !== 'true') {
-    SpreadsheetApp.getUi().alert('현재 실행 중인 작업이 없습니다.');
+    ui.alert('현재 실행 중인 작업이 없습니다.');
     return;
   }
 
   const progress = (((current - start) / (end - start + 1)) * 100).toFixed(1);
-  SpreadsheetApp.getUi().alert(
+  const lastBeat = heartbeat
+    ? `${Math.floor((Date.now() - heartbeat) / 60000)}분 전`
+    : '기록 없음';
+
+  ui.alert(
     `현재 진행 상황 (통합 문항 검증)\n\n` +
     `모델: Gemini (${VCONFIG.GEMINI_MODEL})\n` +
     `현재 행: ${current} / ${end}\n` +
     `진행률: ${progress}%\n` +
-    `배치 크기: ${batch}`
+    `배치 크기: ${batch}\n` +
+    `마지막 진척: ${lastBeat}`
   );
 }
 
@@ -170,13 +203,19 @@ function processVerificationQueue() {
     if (currentRow > endRow) break;
     if (props.getProperty(VCONFIG.PROP.STOP) === 'true') break;
 
-    // 시간 초과 체크
-    if (Date.now() - startTime > VCONFIG.MAX_EXEC_MS) {
+    // ── v3: 행 시작 전 시간 예산 체크 ──
+    // 한 행이 들어갈 충분한 시간이 없으면 즉시 다음 배치로 넘김
+    const elapsed   = Date.now() - startTime;
+    const remaining = VCONFIG.MAX_EXEC_MS - elapsed;
+    if (remaining < VCONFIG.ROW_TIME_RESERVE_MS) {
       props.setProperty(VCONFIG.PROP.CURRENT, String(currentRow));
       scheduleNextBatch_();
       ss.toast(`시간 제한 근접. ${currentRow}행부터 재개됩니다.`);
       return;
     }
+
+    // ── v3: 행 시작 시 heartbeat 갱신 ──
+    props.setProperty(VCONFIG.PROP.HEARTBEAT, String(Date.now()));
 
     const row = batchData[i];
     const stem       = String(row[VCONFIG.COL.STEM - 1]        || '').trim();   // E
@@ -201,7 +240,9 @@ function processVerificationQueue() {
           .replace('{problem}', stem)
           .replace('{format}', formatGuide);
 
-        const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant);
+        // v3: 남은 시간의 절반을 STEP 1 예산으로
+        const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / 2;
+        const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget);
         totalApiTime += (Date.now() - t1);
 
         // 결과 정규화
@@ -211,6 +252,11 @@ function processVerificationQueue() {
 
         sheet.getRange(currentRow, VCONFIG.COL.P_VERDICT, 1, 3)
           .setValues([[verdict, derived, note]]);
+
+        // S열: STEP 1 thinking 토큰 수 기록 (난이도 지표)
+        const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
+        sheet.getRange(currentRow, VCONFIG.COL.THINKING_TOKENS)
+          .setValue(thinkingTokens);
       }
 
       // ───── STEP 2: 해설 검증 ─────
@@ -223,7 +269,9 @@ function processVerificationQueue() {
           .replace(/\{problem\}/g, stem)
           .replace(/\{solution\}/g, solution);
 
-        const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant);
+        // v3: 남은 시간 전체를 STEP 2 예산으로
+        const stepBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
+        const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget);
         totalApiTime += (Date.now() - t2);
 
         const sVerdict = String(sResult.verdict || 'error').toLowerCase();
@@ -233,6 +281,8 @@ function processVerificationQueue() {
           .setValues([[sVerdict, sError]]);
       }
 
+      // ── v3: 행 완료 시 heartbeat 갱신 ──
+      props.setProperty(VCONFIG.PROP.HEARTBEAT, String(Date.now()));
       rowsProcessed++;
 
     } catch (e) {
@@ -301,7 +351,8 @@ function testSingleRowVerification() {
         .replace('{format}', formatGuide);
 
       const t1 = Date.now();
-      const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant);
+      // 단일 행 테스트는 충분한 예산(3분) 부여
+      const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, 180000);
       Logger.log(`문제검증 (${Date.now() - t1}ms): ${JSON.stringify(pResult)}`);
 
       sheet.getRange(rowNum, VCONFIG.COL.P_VERDICT, 1, 3).setValues([[
@@ -309,6 +360,11 @@ function testSingleRowVerification() {
         String(pResult.derived_answer || ''),
         `[TEST] ${String(pResult.solution_note || '')}`
       ]]);
+
+      // S열: thinking 토큰 수 기록
+      const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
+      sheet.getRange(rowNum, VCONFIG.COL.THINKING_TOKENS).setValue(thinkingTokens);
+      Logger.log(`thinking_tokens: ${thinkingTokens}`);
     }
 
     // ── 해설 검증 ──
@@ -318,7 +374,7 @@ function testSingleRowVerification() {
         .replace(/\{solution\}/g, solution);
 
       const t2 = Date.now();
-      const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant);
+      const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, 180000);
       Logger.log(`해설검증 (${Date.now() - t2}ms): ${JSON.stringify(sResult)}`);
 
       sheet.getRange(rowNum, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
@@ -384,14 +440,33 @@ function getFormatGuide(type) {
    5. Gemini API
    ═══════════════════════════════════════════════ */
 
-function callGeminiWithRetry_(sys, usr, ast) {
+/**
+ * v3: timeBudgetMs 추가 — 재시도 전 남은 시간 체크
+ * @param {number} timeBudgetMs  이 호출에 허용된 총 시간(ms). undefined면 무제한
+ */
+function callGeminiWithRetry_(sys, usr, ast, timeBudgetMs) {
+  const startedAt = Date.now();
+
   for (let attempt = 0; attempt < VCONFIG.MAX_RETRIES; attempt++) {
     try {
       return callGeminiUnified_(sys, usr, ast);
     } catch (e) {
-      if (attempt === VCONFIG.MAX_RETRIES - 1) throw e;
+      const isLastAttempt = (attempt === VCONFIG.MAX_RETRIES - 1);
+      if (isLastAttempt) throw e;
+
+      const sleepMs = VCONFIG.RETRY_DELAY_MS * (attempt + 1);
+      const elapsed = Date.now() - startedAt;
+      // 재시도하려면: 현재까지 경과 + sleep + 다음 호출 한 번분(약 65초) 가 예산 안에 들어와야
+      const needed  = elapsed + sleepMs + VCONFIG.API_CALL_RESERVE_MS;
+
+      if (timeBudgetMs && needed > timeBudgetMs) {
+        Logger.log(`Time budget exhausted, skip retry. ` +
+                   `(elapsed=${elapsed}ms, budget=${timeBudgetMs}ms)`);
+        throw new Error(`시간 예산 초과로 재시도 포기: ${e.message}`);
+      }
+
       Logger.log(`Gemini retry ${attempt + 1}/${VCONFIG.MAX_RETRIES}: ${e.message}`);
-      Utilities.sleep(VCONFIG.RETRY_DELAY_MS * (attempt + 1));
+      Utilities.sleep(sleepMs);
     }
   }
 }
@@ -435,7 +510,14 @@ function callGeminiUnified_(sys, usr, ast) {
   // 디버그: 원본 응답 로깅 (최초 500자)
   Logger.log('[Gemini Raw] ' + content.substring(0, 500));
 
-  return safeParseGeminiJson_(content);
+  // usageMetadata에서 thinking 토큰 수 추출 (난이도 지표)
+  const usage = json?.usageMetadata || {};
+  const parsed = safeParseGeminiJson_(content);
+  parsed._usage = {
+    thoughtsTokenCount: usage.thoughtsTokenCount || 0,
+    totalTokenCount:    usage.totalTokenCount || 0,
+  };
+  return parsed;
 }
 
 
@@ -668,9 +750,297 @@ function finishVerification_(message) {
   props.deleteProperty(VCONFIG.PROP.END);
   props.deleteProperty(VCONFIG.PROP.START);
   props.deleteProperty(VCONFIG.PROP.BATCH);
+  props.deleteProperty(VCONFIG.PROP.HEARTBEAT);  // v3: heartbeat도 정리
   props.setProperty(VCONFIG.PROP.STOP, 'false');
   props.setProperty(VCONFIG.PROP.RUNNING, 'false');
 
   SpreadsheetApp.getActiveSpreadsheet().toast(message, '문항 검증', 5);
   Logger.log(`검증 종료: ${message}`);
+}
+
+
+/* ═══════════════════════════════════════════════
+   7. v3: Lazy Watchdog (메뉴 액션 시 멈춤 감지)
+   ═══════════════════════════════════════════════ */
+
+/**
+ * 이전 검증 작업이 멈춘 상태인지 검사하고 사용자에게 처리 옵션 제공
+ *
+ * @param {GoogleAppsScript.Base.Ui} ui
+ * @return {'continue'|'resumed'|'cancel'}
+ *   - 'continue': 멈춤 없음 또는 사용자가 NO 선택 후 정리 완료 → 새 작업 진행 가능
+ *   - 'resumed':  사용자가 YES 선택 → 자동 재개 시작됨 → 호출자는 종료
+ *   - 'cancel':   사용자가 CANCEL → 호출자는 종료
+ */
+function checkAndHandleStaleRun_(ui) {
+  const props = PropertiesService.getScriptProperties();
+  const running   = props.getProperty(VCONFIG.PROP.RUNNING);
+  const heartbeat = parseInt(props.getProperty(VCONFIG.PROP.HEARTBEAT), 10);
+  const current   = parseInt(props.getProperty(VCONFIG.PROP.CURRENT), 10);
+  const end       = parseInt(props.getProperty(VCONFIG.PROP.END), 10);
+
+  // 진행 중인 작업이 없거나 정보 부족 → 멈춤 검사 불가
+  if (running !== 'true' || !heartbeat || !current || !end) {
+    return 'continue';
+  }
+
+  const minutesSince = Math.floor((Date.now() - heartbeat) / 60000);
+  if (minutesSince < VCONFIG.WATCHDOG_STALE_MIN) {
+    return 'continue';   // 임계치 미만 — 정상 진행 중
+  }
+
+  // ── 멈춤 감지 ──
+  const choice = ui.alert(
+    '⚠️ 이전 작업 멈춤 감지',
+    `이전 검증 작업이 ${minutesSince}분 전부터 진척이 없습니다.\n` +
+    `(현재 행: ${current}, 종료 행: ${end})\n\n` +
+    `→ YES: 행 ${current}을(를) 'timeout'으로 마킹하고 ${current + 1}행부터 자동 재개\n` +
+    `→ NO: 이 작업을 정리(중단)\n` +
+    `→ CANCEL: 아무 동작 없이 닫기`,
+    ui.ButtonSet.YES_NO_CANCEL
+  );
+
+  if (choice === ui.Button.CANCEL || choice === ui.Button.CLOSE) {
+    return 'cancel';
+  }
+
+  if (choice === ui.Button.YES) {
+    markRowAsTimeout_(current, minutesSince);
+
+    // 다음 행부터 재개
+    const nextRow = current + 1;
+    if (nextRow > end) {
+      finishVerification_(`행 ${current} timeout 처리 후 종료(범위 끝)`);
+      ui.alert(`행 ${current}을(를) timeout으로 마킹했습니다. 범위가 끝나서 작업을 종료합니다.`);
+      return 'resumed';
+    }
+
+    props.setProperty(VCONFIG.PROP.CURRENT, String(nextRow));
+    props.setProperty(VCONFIG.PROP.HEARTBEAT, String(Date.now()));
+    props.setProperty(VCONFIG.PROP.STOP, 'false');
+    props.setProperty(VCONFIG.PROP.RUNNING, 'true');
+
+    deleteVerifyTriggers_();
+    scheduleNextBatch_();
+
+    ui.alert(
+      `행 ${current}을(를) timeout으로 마킹했습니다.\n` +
+      `${nextRow}행부터 약 3초 뒤 자동 재개됩니다.`
+    );
+    return 'resumed';
+  }
+
+  // NO: 정리하고 새 작업 진행 가능 상태로
+  finishVerification_('이전 작업이 사용자에 의해 정리되었습니다.');
+  return 'continue';
+}
+
+/**
+ * 행에 timeout 마킹 (이미 채워진 칸은 건드리지 않음)
+ */
+function markRowAsTimeout_(row, minutesSince) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(VCONFIG.DATA_SHEET);
+  if (!sheet) return;
+
+  const note = `[Watchdog] ${minutesSince}분 무진척으로 자동 스킵`;
+
+  // N열(P_VERDICT) 비어있으면 timeout 마킹
+  const nVal = String(sheet.getRange(row, VCONFIG.COL.P_VERDICT).getValue() || '').trim();
+  if (nVal === '') {
+    sheet.getRange(row, VCONFIG.COL.P_VERDICT).setValue('timeout');
+    sheet.getRange(row, VCONFIG.COL.P_NOTE).setValue(note);
+  }
+
+  // Q열(S_VERDICT) 비어있으면 timeout 마킹
+  const qVal = String(sheet.getRange(row, VCONFIG.COL.S_VERDICT).getValue() || '').trim();
+  if (qVal === '') {
+    sheet.getRange(row, VCONFIG.COL.S_VERDICT).setValue('timeout');
+    sheet.getRange(row, VCONFIG.COL.S_ERROR).setValue(note);
+  }
+
+  SpreadsheetApp.flush();
+  Logger.log(`행 ${row} timeout 마킹 완료 (${minutesSince}분 무진척)`);
+}
+
+
+/* ═══════════════════════════════════════════════
+   8. v3: Error/Timeout 행 재검증 (retryErrorRows)
+   ═══════════════════════════════════════════════ */
+
+/**
+ * 메뉴 호출: 지정 범위 내 N열 또는 Q열이 'error'/'timeout'인 행만 재검증
+ *
+ * - N열만 error/timeout이면 STEP 1만 재실행
+ * - Q열만 error/timeout이면 STEP 2만 재실행
+ * - 둘 다이면 둘 다 재실행
+ * - 동기 실행: 시간 초과 시 사용자에게 안내 후 다시 메뉴 실행 권장
+ */
+function retryErrorRows() {
+  const ui = SpreadsheetApp.getUi();
+
+  // 멈춤 감지 먼저
+  const staleResult = checkAndHandleStaleRun_(ui);
+  if (staleResult === 'cancel' || staleResult === 'resumed') return;
+
+  const input = ui.prompt(
+    'Error/Timeout 행 재검증',
+    '재검증할 행 범위를 입력하세요 (예: 2-100)\n' +
+    'N열 또는 Q열이 error 또는 timeout인 행만 재검증됩니다.',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (input.getSelectedButton() !== ui.Button.OK) return;
+
+  const range = parseRowRange(input.getResponseText());
+  if (!range || range.startRow < 2) {
+    ui.alert('유효하지 않은 범위입니다. (예: 2-100)');
+    return;
+  }
+
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(VCONFIG.DATA_SHEET);
+  if (!sheet) { ui.alert('Data_DS 시트 없음'); return; }
+
+  // 범위 데이터 일괄 읽기
+  const numRows = range.endRow - range.startRow + 1;
+  const data = sheet.getRange(range.startRow, 1, numRows, 18).getValues();
+
+  // error/timeout 행 추출
+  const targets = [];
+  for (let i = 0; i < numRows; i++) {
+    const nVal = String(data[i][VCONFIG.COL.P_VERDICT - 1] || '').toLowerCase().trim();
+    const qVal = String(data[i][VCONFIG.COL.S_VERDICT - 1] || '').toLowerCase().trim();
+
+    const nIsErr = (nVal === 'error' || nVal === 'timeout');
+    const qIsErr = (qVal === 'error' || qVal === 'timeout');
+
+    if (nIsErr || qIsErr) {
+      targets.push({
+        row: range.startRow + i,
+        retryProblem: nIsErr,
+        retrySolution: qIsErr,
+      });
+    }
+  }
+
+  if (targets.length === 0) {
+    ui.alert(`범위 내에 error 또는 timeout 행이 없습니다. (행 ${range.startRow}~${range.endRow})`);
+    return;
+  }
+
+  const previewRows = targets.slice(0, 10).map(t => t.row).join(', ');
+  const previewMore = targets.length > 10 ? ` 외 ${targets.length - 10}개` : '';
+
+  const confirm = ui.alert(
+    'Error/Timeout 행 재검증 확인',
+    `재검증 대상: ${targets.length}개 행\n` +
+    `행 번호: ${previewRows}${previewMore}\n\n` +
+    `재검증을 시작하시겠습니까?`,
+    ui.ButtonSet.YES_NO
+  );
+  if (confirm !== ui.Button.YES) return;
+
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) { ui.alert('GEMINI_API_KEY가 설정되지 않았습니다.'); return; }
+
+  // 프롬프트 로드
+  const pPrompts = getPromptSet('gemini_problem_verify');
+  const sPrompts = getPromptSet('gemini_solution_verify');
+  if (!pPrompts.system || !sPrompts.system) {
+    ui.alert('프롬프트 로드 실패. pmt 시트를 확인하세요.');
+    return;
+  }
+
+  const startTime = Date.now();
+  let processed = 0;
+  let errors    = 0;
+  let lastDoneRow = 0;
+
+  for (let k = 0; k < targets.length; k++) {
+    const t = targets[k];
+
+    // ── 시간 예산 체크 ──
+    const remaining = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
+    if (remaining < VCONFIG.ROW_TIME_RESERVE_MS) {
+      ui.alert(
+        `시간 제한 근접으로 중단됩니다.\n\n` +
+        `처리 완료: ${processed} / ${targets.length}\n` +
+        `실패: ${errors}\n` +
+        `마지막 처리 행: ${lastDoneRow || '없음'}\n\n` +
+        `남은 행은 메뉴를 다시 실행하면 처리됩니다.`
+      );
+      return;
+    }
+
+    try {
+      const stem       = String(sheet.getRange(t.row, VCONFIG.COL.STEM).getValue() || '').trim();
+      const solution   = String(sheet.getRange(t.row, VCONFIG.COL.SOLUTION).getValue() || '').trim();
+      const answerType = String(sheet.getRange(t.row, VCONFIG.COL.ANSWER_TYPE).getValue() || '').trim();
+
+      // ── STEP 1: 문제 검증 (필요 시) ──
+      if (t.retryProblem) {
+        if (stem === '') {
+          sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3)
+            .setValues([['skip', '', 'E열(문제) 비어있음']]);
+        } else {
+          const formatGuide = getFormatGuide(answerType);
+          const userContent = pPrompts.user
+            .replace('{problem}', stem)
+            .replace('{format}', formatGuide);
+
+          // STEP 1에 남은 시간의 절반 할당 (둘 다 재시도면)
+          const split = (t.retryProblem && t.retrySolution) ? 2 : 1;
+          const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / split;
+          const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget);
+
+          sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3).setValues([[
+            String(pResult.verdict || 'error').toLowerCase(),
+            String(pResult.derived_answer || '').trim(),
+            String(pResult.solution_note || '').trim(),
+          ]]);
+
+          const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
+          sheet.getRange(t.row, VCONFIG.COL.THINKING_TOKENS).setValue(thinkingTokens);
+        }
+      }
+
+      // ── STEP 2: 해설 검증 (필요 시) ──
+      if (t.retrySolution) {
+        if (solution === '') {
+          sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2)
+            .setValues([['SKIP', 'C열(풀이) 비어있음']]);
+        } else {
+          const userContent2 = sPrompts.user
+            .replace(/\{problem\}/g, stem)
+            .replace(/\{solution\}/g, solution);
+
+          const stepBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
+          const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget);
+
+          sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
+            String(sResult.verdict || 'error').toLowerCase(),
+            String(sResult.error_report || '').trim(),
+          ]]);
+        }
+      }
+
+      processed++;
+      lastDoneRow = t.row;
+
+    } catch (e) {
+      Logger.log(`retryErrorRows row ${t.row} error: ${e.message}`);
+      errors++;
+      // 실패해도 N/Q열은 그대로 두어 다음 재시도 시 다시 잡히게 함
+    }
+
+    if (k % 3 === 0) SpreadsheetApp.flush();
+  }
+
+  SpreadsheetApp.flush();
+
+  ui.alert(
+    `Error/Timeout 행 재검증 완료\n\n` +
+    `대상: ${targets.length}개\n` +
+    `성공: ${processed}\n` +
+    `실패: ${errors}`
+  );
 }

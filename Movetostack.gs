@@ -25,7 +25,7 @@ function moveResultsToStack() {
   }
 
   const numRows = srcLastRow - 1;   // 2행부터 마지막행까지
-  const numCols = 18;                // A~R = 18열
+  const numCols = 19;                // A~S = 19열 (S열: thinking_tokens 추가)
   const srcData = srcSheet.getRange(2, 1, numRows, numCols).getValues();
 
   // 완전히 빈 행 제거

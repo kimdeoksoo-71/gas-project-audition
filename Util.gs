@@ -7,6 +7,7 @@
  *   - 구 Problem/Solution 개별 진행 확인 함수 제거
  *   - parseRowRange 제거 (MainMenu.gs에서 정의)
  *   - forceStopAll → 통합 키 대응
+ *   - v3: HEARTBEAT 키 정리 추가
  * ============================================================
  */
 
@@ -27,6 +28,7 @@ function forceStopAll() {
   // 통합 검증 중단
   props.setProperty('V_STOP', 'true');
   props.setProperty('V_RUNNING', 'false');
+  props.deleteProperty('V_LAST_HEARTBEAT');  // v3: heartbeat 정리
 
   // 레거시 키도 정리 (혹시 남아있을 경우)
   props.setProperty('STOP_REQUESTED', 'true');

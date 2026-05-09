@@ -24,9 +24,9 @@ function getErrorData(startRow, endRow) {
   var numRows = Math.min(endRow, lastRow) - startRow + 1;
   if (numRows < 1) return [];
 
-  // A열(1)부터 R열(18)까지 한 번에 가져옴 (인덱스는 0부터 시작하므로 R은 17)
-  // 범위: startRow, 1열, numRows개, 18개 열
-  var data = sheet.getRange(startRow, 1, numRows, 18).getValues();
+  // A열(1)부터 S열(19)까지 한 번에 가져옴
+  // 범위: startRow, 1열, numRows개, 19개 열
+  var data = sheet.getRange(startRow, 1, numRows, 19).getValues();
   
   var filteredData = [];
   
@@ -34,7 +34,7 @@ function getErrorData(startRow, endRow) {
   for (var i = 0; i < data.length; i++) {
     var row = data[i];
     
-    // 열 인덱스 매핑 (A=0, C=2, E=4, N=13, P=15, Q=16, R=17)
+    // 열 인덱스 매핑 (A=0, C=2, E=4, N=13, P=15, Q=16, R=17, S=18)
     var source = row[0];   // A: 문제 출처
     var solution = row[2]; // C: 풀이
     var problem = row[4];  // E: 문제
@@ -42,6 +42,7 @@ function getErrorData(startRow, endRow) {
     var p_note = row[15];   // P: 문제 풀이 노트
     var q_status = row[16]; // Q: 풀이 오류 판정
     var r_error = row[17];  // R: 오류 내용
+    var thinking_tokens = row[18]; // S: thinking 토큰 수
     
     var currentRowNum = startRow + i;
 
@@ -55,7 +56,8 @@ function getErrorData(startRow, endRow) {
         n_status: n_status,
         solution: solution,
         q_status: q_status,
-        r_error: r_error
+        r_error: r_error,
+        thinking_tokens: thinking_tokens
       });
     }
   }
