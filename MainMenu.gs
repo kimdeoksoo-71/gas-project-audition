@@ -36,7 +36,9 @@ function onOpen() {
     .addSeparator()
     .addItem('📦 처리결과 Stack에 저장', 'moveResultsToStack')
     .addSeparator()
-    .addItem('프롬프트를 github에 푸시', 'pushPromptCsvToGithub');
+    .addItem('프롬프트를 github에 푸시', 'pushPromptCsvToGithub')
+    .addSeparator()
+    .addItem('🔍 503 에러 진단', 'run503Diagnostic');
 
   // ── 서브메뉴: Latex 변환 (기존 유지) ──
   const subMenuB = ui.createMenu('Latex 변환')

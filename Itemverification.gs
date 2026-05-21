@@ -15,6 +15,14 @@
  *   - retryErrorRows: 'error' 또는 'timeout' 행만 골라서 재검증
  *   - V_LAST_HEARTBEAT 키로 진척 시각 추적
  * ============================================================
+ * v4 변경사항 (2026-05-18):
+ *   - 503 복원력 대폭 강화: 지수 백오프 + 지터, 최대 5회 재시도
+ *   - 503(재시도 가능) vs 4xx(영구 실패) 에러 구분
+ *   - 행 간 쿨다운(1.5초) 추가로 연속 호출 부하 완화
+ *   - 연속 503 감지 시 배치 내 1분 대기 (서버 회복 대기)
+ *   - 배치 간 간격 3초→10초로 확대
+ *   - API_CALL_RESERVE_MS 65초→45초로 현실화
+ * ============================================================
  */
 
 /* ─── 설정 ─── */
@@ -26,8 +34,8 @@ const VCONFIG = {
   TEMPERATURE:  0.1,
 
   MAX_EXEC_MS:    1000 * 60 * 3.5,   // 3.5분
-  MAX_RETRIES:    2,
-  RETRY_DELAY_MS: 2000,
+  MAX_RETRIES:    5,                   // v4: 2→5 (503 대응)
+  RETRY_DELAY_MS: 3000,               // v4: 2000→3000 (지수 백오프 base)
 
   INITIAL_BATCH: 5,    // 2.5-pro + thinking 감안, 안전하게 축소
   MIN_BATCH:     2,
@@ -36,7 +44,13 @@ const VCONFIG = {
   /* v3: 워치독/시간예산 설정 */
   WATCHDOG_STALE_MIN:  20,        // 20분 무진척 → 멈춤 판정
   ROW_TIME_RESERVE_MS: 90000,     // 한 행 처리에 최소 확보할 시간(90초)
-  API_CALL_RESERVE_MS: 65000,     // API 한 번 호출에 필요한 시간(60s+여유)
+  API_CALL_RESERVE_MS: 45000,     // v4: 65000→45000 (실측 기반 현실화)
+
+  /* v4: 503 복원력 설정 */
+  INTER_ROW_COOLDOWN_MS:    1500,   // 행 간 쿨다운 (1.5초)
+  CONSECUTIVE_503_THRESHOLD: 3,     // 연속 503 이 횟수 초과 시 일시 중단
+  CONSECUTIVE_503_PAUSE_MS:  60000, // 연속 503 시 대기 시간 (1분)
+  BATCH_INTERVAL_MS:         10000, // v4: 3000→10000 (배치 간 간격)
 
   /* Data_DS 열 번호 */
   COL: {
@@ -198,13 +212,13 @@ function processVerificationQueue() {
   const startTime = Date.now();
   let rowsProcessed = 0;
   let totalApiTime  = 0;
+  let consecutive503 = 0;   // v4: 연속 503 카운터
 
   for (let i = 0; i < batchSize; i++) {
     if (currentRow > endRow) break;
     if (props.getProperty(VCONFIG.PROP.STOP) === 'true') break;
 
     // ── v3: 행 시작 전 시간 예산 체크 ──
-    // 한 행이 들어갈 충분한 시간이 없으면 즉시 다음 배치로 넘김
     const elapsed   = Date.now() - startTime;
     const remaining = VCONFIG.MAX_EXEC_MS - elapsed;
     if (remaining < VCONFIG.ROW_TIME_RESERVE_MS) {
@@ -212,6 +226,25 @@ function processVerificationQueue() {
       scheduleNextBatch_();
       ss.toast(`시간 제한 근접. ${currentRow}행부터 재개됩니다.`);
       return;
+    }
+
+    // ── v4: 연속 503 감지 시 배치 내 일시 중단 ──
+    if (consecutive503 >= VCONFIG.CONSECUTIVE_503_THRESHOLD) {
+      Logger.log(`연속 503 ${consecutive503}회 감지. ${VCONFIG.CONSECUTIVE_503_PAUSE_MS / 1000}초 대기...`);
+      ss.toast(`서버 과부하 감지. ${VCONFIG.CONSECUTIVE_503_PAUSE_MS / 1000}초 대기 중...`);
+
+      // 대기 후에도 시간이 남는지 체크
+      const afterPause = (Date.now() - startTime) + VCONFIG.CONSECUTIVE_503_PAUSE_MS;
+      if (afterPause + VCONFIG.ROW_TIME_RESERVE_MS > VCONFIG.MAX_EXEC_MS) {
+        // 대기하면 시간 초과 → 다음 배치로 넘김
+        props.setProperty(VCONFIG.PROP.CURRENT, String(currentRow));
+        scheduleNextBatch_();
+        ss.toast(`503 연속 발생 + 시간 부족. ${currentRow}행부터 다음 배치에서 재개.`);
+        return;
+      }
+
+      Utilities.sleep(VCONFIG.CONSECUTIVE_503_PAUSE_MS);
+      consecutive503 = 0;  // 카운터 리셋
     }
 
     // ── v3: 행 시작 시 heartbeat 갱신 ──
@@ -245,6 +278,9 @@ function processVerificationQueue() {
         const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget);
         totalApiTime += (Date.now() - t1);
 
+        // v4: 성공 시 연속 503 카운터 리셋
+        consecutive503 = 0;
+
         // 결과 정규화
         const verdict = String(pResult.verdict || 'error').toLowerCase();
         const derived = String(pResult.derived_answer || '').trim();
@@ -258,6 +294,9 @@ function processVerificationQueue() {
         sheet.getRange(currentRow, VCONFIG.COL.THINKING_TOKENS)
           .setValue(thinkingTokens);
       }
+
+      // ── v4: STEP 1 → STEP 2 사이 쿨다운 ──
+      Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
 
       // ───── STEP 2: 해설 검증 ─────
       if (solution === '') {
@@ -274,6 +313,9 @@ function processVerificationQueue() {
         const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget);
         totalApiTime += (Date.now() - t2);
 
+        // v4: 성공 시 연속 503 카운터 리셋
+        consecutive503 = 0;
+
         const sVerdict = String(sResult.verdict || 'error').toLowerCase();
         const sError   = String(sResult.error_report || '').trim();
 
@@ -289,10 +331,23 @@ function processVerificationQueue() {
       Logger.log(`Row ${currentRow} error: ${e.message}`);
       sheet.getRange(currentRow, VCONFIG.COL.P_VERDICT).setValue('error');
       sheet.getRange(currentRow, VCONFIG.COL.P_NOTE).setValue(`[Error] ${e.message}`);
+
+      // v4: 503 에러인 경우 연속 카운터 증가
+      if (e.message && e.message.includes('503')) {
+        consecutive503++;
+        Logger.log(`연속 503 카운터: ${consecutive503}/${VCONFIG.CONSECUTIVE_503_THRESHOLD}`);
+      } else {
+        consecutive503 = 0;  // 503이 아닌 에러면 카운터 리셋
+      }
     }
 
     currentRow++;
     props.setProperty(VCONFIG.PROP.CURRENT, String(currentRow));
+
+    // ── v4: 다음 행 시작 전 쿨다운 (마지막 행이 아닐 때만) ──
+    if (i < batchSize - 1 && currentRow <= endRow) {
+      Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
+    }
   }
 
   SpreadsheetApp.flush();
@@ -441,8 +496,13 @@ function getFormatGuide(type) {
    ═══════════════════════════════════════════════ */
 
 /**
- * v3: timeBudgetMs 추가 — 재시도 전 남은 시간 체크
+ * v4: 503 복원력 강화 — 지수 백오프 + 지터, 영구/재시도 에러 구분
+ *
+ * @param {string} sys   시스템 프롬프트
+ * @param {string} usr   사용자 프롬프트
+ * @param {string} ast   어시스턴트 프롬프트
  * @param {number} timeBudgetMs  이 호출에 허용된 총 시간(ms). undefined면 무제한
+ * @return {Object} 파싱된 Gemini 응답
  */
 function callGeminiWithRetry_(sys, usr, ast, timeBudgetMs) {
   const startedAt = Date.now();
@@ -451,24 +511,59 @@ function callGeminiWithRetry_(sys, usr, ast, timeBudgetMs) {
     try {
       return callGeminiUnified_(sys, usr, ast);
     } catch (e) {
+      const errorMsg = e.message || '';
+      const isRetryable = is503Error_(errorMsg);
       const isLastAttempt = (attempt === VCONFIG.MAX_RETRIES - 1);
-      if (isLastAttempt) throw e;
 
-      const sleepMs = VCONFIG.RETRY_DELAY_MS * (attempt + 1);
+      // v4: 영구 에러(400, 401, 403, 404)는 즉시 포기
+      if (!isRetryable) {
+        Logger.log(`영구 에러, 재시도 안함: ${errorMsg.substring(0, 150)}`);
+        throw e;
+      }
+
+      if (isLastAttempt) {
+        Logger.log(`최대 재시도(${VCONFIG.MAX_RETRIES}회) 소진: ${errorMsg.substring(0, 150)}`);
+        throw e;
+      }
+
+      // v4: 지수 백오프 + 지터 (base * 2^attempt + random jitter)
+      const baseDelay = VCONFIG.RETRY_DELAY_MS * Math.pow(2, attempt);
+      const jitter    = Math.floor(Math.random() * 2000);  // 0~2초 지터
+      const sleepMs   = Math.min(baseDelay + jitter, 60000); // 최대 60초 캡
+
+      // v4: 시간 예산 체크 (API_CALL_RESERVE_MS 축소 반영)
       const elapsed = Date.now() - startedAt;
-      // 재시도하려면: 현재까지 경과 + sleep + 다음 호출 한 번분(약 65초) 가 예산 안에 들어와야
       const needed  = elapsed + sleepMs + VCONFIG.API_CALL_RESERVE_MS;
 
       if (timeBudgetMs && needed > timeBudgetMs) {
-        Logger.log(`Time budget exhausted, skip retry. ` +
-                   `(elapsed=${elapsed}ms, budget=${timeBudgetMs}ms)`);
-        throw new Error(`시간 예산 초과로 재시도 포기: ${e.message}`);
+        Logger.log(`시간 예산 부족으로 재시도 스킵 (attempt ${attempt + 1}/${VCONFIG.MAX_RETRIES}, ` +
+                   `elapsed=${elapsed}ms, sleep=${sleepMs}ms, budget=${timeBudgetMs}ms)`);
+        throw new Error(`시간 예산 초과로 재시도 포기: ${errorMsg}`);
       }
 
-      Logger.log(`Gemini retry ${attempt + 1}/${VCONFIG.MAX_RETRIES}: ${e.message}`);
+      Logger.log(`Gemini 503 재시도 ${attempt + 1}/${VCONFIG.MAX_RETRIES}: ` +
+                 `${sleepMs}ms 대기 (base=${baseDelay}, jitter=${jitter})`);
       Utilities.sleep(sleepMs);
     }
   }
+}
+
+/**
+ * v4: HTTP 에러 코드가 재시도 가능한지 판별
+ * 503, 429, 500, 502, 504 → 재시도 가능
+ * 400, 401, 403, 404 등 → 영구 실패
+ */
+function is503Error_(errorMsg) {
+  // 명시적 재시도 가능 코드
+  const retryableCodes = ['503', '429', '500', '502', '504'];
+  for (const code of retryableCodes) {
+    if (errorMsg.includes(`(${code})`)) return true;
+  }
+  // "high demand", "UNAVAILABLE" 등의 키워드도 재시도 대상
+  if (errorMsg.includes('UNAVAILABLE') || errorMsg.includes('high demand')) return true;
+  // content 없음 (간헐적 빈 응답)도 재시도
+  if (errorMsg.includes('content를 찾을 수 없습니다')) return true;
+  return false;
 }
 
 function callGeminiUnified_(sys, usr, ast) {
@@ -715,9 +810,11 @@ function extractFieldsByRegex_(text) {
 
 /** 적응형 배치 크기 계산 (행당 2회 API 호출 기준) */
 function calcAdaptiveBatch_(avgMsPerRow) {
-  // 남은 시간에 맞춰 배치 크기 결정 (안전 마진 30초)
-  const available = VCONFIG.MAX_EXEC_MS - 30000;
-  let ideal = Math.floor(available / Math.max(avgMsPerRow, 1000));
+  // v4: 쿨다운 시간도 포함하여 계산
+  const cooldownPerRow = VCONFIG.INTER_ROW_COOLDOWN_MS * 2; // STEP간 + 행간
+  const effectivePerRow = Math.max(avgMsPerRow + cooldownPerRow, 1000);
+  const available = VCONFIG.MAX_EXEC_MS - 30000; // 안전 마진 30초
+  let ideal = Math.floor(available / effectivePerRow);
   ideal = Math.max(VCONFIG.MIN_BATCH, Math.min(VCONFIG.MAX_BATCH, ideal));
   return ideal;
 }
@@ -727,7 +824,7 @@ function scheduleNextBatch_() {
   deleteVerifyTriggers_();
   ScriptApp.newTrigger(VCONFIG.TRIGGER_FN)
     .timeBased()
-    .after(3000)   // 3초 후 재개
+    .after(VCONFIG.BATCH_INTERVAL_MS)   // v4: 3초→10초
     .create();
 }
 
@@ -825,7 +922,7 @@ function checkAndHandleStaleRun_(ui) {
 
     ui.alert(
       `행 ${current}을(를) timeout으로 마킹했습니다.\n` +
-      `${nextRow}행부터 약 3초 뒤 자동 재개됩니다.`
+      `${nextRow}행부터 약 ${VCONFIG.BATCH_INTERVAL_MS / 1000}초 뒤 자동 재개됩니다.`
     );
     return 'resumed';
   }
@@ -1003,6 +1100,11 @@ function retryErrorRows() {
         }
       }
 
+      // ── v4: STEP 간 쿨다운 ──
+      if (t.retryProblem && t.retrySolution) {
+        Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
+      }
+
       // ── STEP 2: 해설 검증 (필요 시) ──
       if (t.retrySolution) {
         if (solution === '') {
@@ -1030,6 +1132,11 @@ function retryErrorRows() {
       Logger.log(`retryErrorRows row ${t.row} error: ${e.message}`);
       errors++;
       // 실패해도 N/Q열은 그대로 두어 다음 재시도 시 다시 잡히게 함
+    }
+
+    // ── v4: 행 간 쿨다운 ──
+    if (k < targets.length - 1) {
+      Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
     }
 
     if (k % 3 === 0) SpreadsheetApp.flush();
