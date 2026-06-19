@@ -3,15 +3,26 @@
   <head>
     <base target="_top">
     <meta charset="UTF-8" />
+    <!-- KaTeX (MathJax 대체: 렌더링 속도 향상) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.css" />
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/contrib/auto-render.min.js"></script>
     <script>
-      window.MathJax = {
-        tex: {
-          inlineMath: [['$', '$'], ['$$', '$$'], ['\\(', '\\)'], ['\(', '\)']]
-        },
-        svg: { fontCache: 'global' }
-      };
+      // 공통 렌더 함수 (auto-render 미로드 시 안전하게 건너뜀)
+      function renderMath(el) {
+        if (typeof renderMathInElement !== 'function' || !el) return;
+        renderMathInElement(el, {
+          delimiters: [
+            { left: '$$', right: '$$', display: true },
+            { left: '\\[', right: '\\]', display: true },
+            { left: '$', right: '$', display: false },
+            { left: '\\(', right: '\\)', display: false }
+          ],
+          throwOnError: false,
+          ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+        });
+      }
     </script>
-    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" async></script>
 
     <style>
       body {
@@ -93,10 +104,8 @@
 
         container.innerHTML = htmlBuffer;
 
-        // MathJax 렌더링
-        if (window.MathJax && window.MathJax.typesetPromise) {
-          window.MathJax.typesetPromise([container]).catch(err => console.error(err));
-        }
+        // KaTeX 렌더링
+        renderMath(container);
       }
 
       function fetchData() {

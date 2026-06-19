@@ -2,18 +2,24 @@
 <html>
   <head>
     <base target="_top">
+    <!-- KaTeX (MathJax 대체: 렌더링 속도 향상) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.css" />
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/contrib/auto-render.min.js"></script>
     <script>
-      MathJax = {
-        tex: {
-          inlineMath: [['$', '$'], ['\\(', '\\)']]
-        },
-        svg: {
-          fontCache: 'global'
-        }
-      };
-    </script>
-    <script type="text/javascript" id="MathJax-script" async
-      src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js">
+      function renderMath(el) {
+        if (typeof renderMathInElement !== 'function' || !el) return;
+        renderMathInElement(el, {
+          delimiters: [
+            { left: '$$', right: '$$', display: true },
+            { left: '\\[', right: '\\]', display: true },
+            { left: '$', right: '$', display: false },
+            { left: '\\(', right: '\\)', display: false }
+          ],
+          throwOnError: false,
+          ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+        });
+      }
     </script>
 
     <style>
@@ -220,9 +226,9 @@
         document.getElementById('val-solution').innerHTML = item.solution;
         document.getElementById('val-r-error').innerHTML = item.r_error;
 
-        if (window.MathJax) {
-          MathJax.typesetPromise().catch(function (err) { console.log('MathJax Error:', err); });
-        }
+        // KaTeX 렌더링 (innerHTML이 갱신된 4개 필드만 대상으로)
+        ['val-problem', 'val-p-note', 'val-solution', 'val-r-error']
+          .forEach(function (id) { renderMath(document.getElementById(id)); });
       }
 
       function setStatus(elementId, statusText) {

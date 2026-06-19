@@ -8,20 +8,10 @@
     const PAYLOAD = JSON.parse(<?= payloadJson ?>);
   </script>
 
-  <!-- MathJax v3: delimiter를 \( \), \[ \]로만 -->
-  <script>
-    window.MathJax = {
-      tex: {
-        inlineMath: [['\\(', '\\)']],
-        displayMath: [['\\[', '\\]']],
-        processEscapes: true
-      },
-      options: {
-        skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre']
-      }
-    };
-  </script>
-  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+  <!-- KaTeX (MathJax 대체): delimiter를 \( \), \[ \]로만 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/contrib/auto-render.min.js"></script>
 
   <style>
     :root{
@@ -465,11 +455,16 @@
       .replace(/'/g, "&#039;");
   }
 
-  async function renderMath(){
-    if (window.MathJax && MathJax.typesetPromise) {
-      if (MathJax.typesetClear) MathJax.typesetClear();
-      await MathJax.typesetPromise();
-    }
+  function renderMath(){
+    if (typeof renderMathInElement !== 'function') return;
+    renderMathInElement(document.body, {
+      delimiters: [
+        { left: '\\[', right: '\\]', display: true },
+        { left: '\\(', right: '\\)', display: false }
+      ],
+      throwOnError: false,
+      ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+    });
   }
 
   async function show(i){

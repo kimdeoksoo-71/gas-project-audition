@@ -23,15 +23,44 @@
  *   - 배치 간 간격 3초→10초로 확대
  *   - API_CALL_RESERVE_MS 65초→45초로 현실화
  * ============================================================
+ * v5 변경사항 (2026-05-26):
+ *   - 모델 프리셋 시스템: 메뉴에서 모델 전환 가능
+ *   - Gemini 3.x 지원: thinking_level 파라미터, temperature 제거
+ *   - 429 spending cap 에러 즉시 중단 (무의미한 재시도 방지)
+ *   - 기본 모델: gemini-3.5-flash (thinking_level: high)
+ * ============================================================
  */
+
+/* ─── 모델 프리셋 ─── */
+const MODEL_PRESETS = {
+  'gemini-3.5-flash': {
+    label:     '3.5 Flash (GA, 고속+고성능)',
+    gen:       '3.x',
+    thinkingLevel: 'HIGH',    // 수학 검증에는 HIGH 필수
+  },
+  'gemini-3.1-pro-preview': {
+    label:     '3.1 Pro Preview (최강 추론)',
+    gen:       '3.x',
+    thinkingLevel: 'HIGH',
+  },
+  'gemini-2.5-pro': {
+    label:     '2.5 Pro (기존 안정)',
+    gen:       '2.x',
+    temperature: 0.1,
+  },
+  'gemini-2.5-flash': {
+    label:     '2.5 Flash (저비용)',
+    gen:       '2.x',
+    temperature: 0.2,
+  },
+};
 
 /* ─── 설정 ─── */
 const VCONFIG = {
   DATA_SHEET: 'Data_DS',
   PMT_SHEET:  'pmt',
 
-  GEMINI_MODEL: 'gemini-2.5-pro',
-  TEMPERATURE:  0.1,
+  GEMINI_MODEL: PropertiesService.getScriptProperties().getProperty('V_GEMINI_MODEL') || 'gemini-3.5-flash',
 
   MAX_EXEC_MS:    1000 * 60 * 3.5,   // 3.5분
   MAX_RETRIES:    5,                   // v4: 2→5 (503 대응)
@@ -63,6 +92,7 @@ const VCONFIG = {
     S_VERDICT:   17,   // Q  해설검증 verdict
     S_ERROR:     18,   // R  error_report
     THINKING_TOKENS: 19, // S  STEP1 thinking 토큰 수 (난이도 지표)
+    MODEL_NAME:      20, // T  사용된 AI 모델명
   },
 
   /* ScriptProperties 키 (통합) */
@@ -123,7 +153,7 @@ function startItemVerification() {
   });
 
   ui.alert(
-    `Gemini로 행 ${range.startRow} ~ ${range.endRow} 검증을 시작합니다.\n` +
+    `[${VCONFIG.GEMINI_MODEL}] 행 ${range.startRow} ~ ${range.endRow} 검증을 시작합니다.\n` +
     `(문제검증 + 해설검증 순차 실행)`
   );
   processVerificationQueue();
@@ -293,6 +323,10 @@ function processVerificationQueue() {
         const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
         sheet.getRange(currentRow, VCONFIG.COL.THINKING_TOKENS)
           .setValue(thinkingTokens);
+
+        // T열: 사용된 모델명 기록
+        sheet.getRange(currentRow, VCONFIG.COL.MODEL_NAME)
+          .setValue(VCONFIG.GEMINI_MODEL);
       }
 
       // ── v4: STEP 1 → STEP 2 사이 쿨다운 ──
@@ -420,6 +454,9 @@ function testSingleRowVerification() {
       const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
       sheet.getRange(rowNum, VCONFIG.COL.THINKING_TOKENS).setValue(thinkingTokens);
       Logger.log(`thinking_tokens: ${thinkingTokens}`);
+
+      // T열: 사용된 모델명 기록
+      sheet.getRange(rowNum, VCONFIG.COL.MODEL_NAME).setValue(VCONFIG.GEMINI_MODEL);
     }
 
     // ── 해설 검증 ──
@@ -549,11 +586,17 @@ function callGeminiWithRetry_(sys, usr, ast, timeBudgetMs) {
 }
 
 /**
- * v4: HTTP 에러 코드가 재시도 가능한지 판별
- * 503, 429, 500, 502, 504 → 재시도 가능
- * 400, 401, 403, 404 등 → 영구 실패
+ * v5: 재시도 가능 여부 판별 — spending cap 429는 영구 에러로 분류
+ * 503, 429(일반), 500, 502, 504 → 재시도 가능
+ * 429(spending cap), 400, 401, 403, 404 → 영구 실패
  */
 function is503Error_(errorMsg) {
+  // v5: spending cap 초과는 재시도 무의미 → 즉시 영구 에러 처리
+  if (errorMsg.includes('spending cap') || errorMsg.includes('RESOURCE_EXHAUSTED')) {
+    Logger.log('[FATAL] 월간 지출 한도 초과. 재시도 불가. https://ai.studio/spend 에서 한도 확인.');
+    return false;
+  }
+
   // 명시적 재시도 가능 코드
   const retryableCodes = ['503', '429', '500', '502', '504'];
   for (const code of retryableCodes) {
@@ -575,13 +618,27 @@ function callGeminiUnified_(sys, usr, ast) {
     contents.push({ role: 'model', parts: [{ text: ast }] });
   }
 
+  // v5: 모델 세대별 generationConfig 분기
+  const preset = MODEL_PRESETS[VCONFIG.GEMINI_MODEL] || {};
+  const genConfig = {
+    response_mime_type: 'application/json',
+  };
+
+  if (preset.gen === '3.x') {
+    // Gemini 3.x: temperature 사용 안함, thinkingConfig 사용
+    // REST API 형식: generationConfig.thinkingConfig.thinkingLevel
+    genConfig.thinkingConfig = {
+      thinkingLevel: (preset.thinkingLevel || 'MEDIUM').toUpperCase(),
+    };
+  } else {
+    // Gemini 2.x: 기존 방식 (temperature 사용)
+    genConfig.temperature = preset.temperature !== undefined ? preset.temperature : 0.1;
+  }
+
   const payload = {
     system_instruction: { parts: [{ text: sys }] },
     contents: contents,
-    generationConfig: {
-      response_mime_type: 'application/json',
-      temperature: VCONFIG.TEMPERATURE,
-    },
+    generationConfig: genConfig,
   };
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${VCONFIG.GEMINI_MODEL}:generateContent?key=${apiKey}`;
@@ -1097,6 +1154,9 @@ function retryErrorRows() {
 
           const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
           sheet.getRange(t.row, VCONFIG.COL.THINKING_TOKENS).setValue(thinkingTokens);
+
+          // T열: 사용된 모델명 기록
+          sheet.getRange(t.row, VCONFIG.COL.MODEL_NAME).setValue(VCONFIG.GEMINI_MODEL);
         }
       }
 
@@ -1150,4 +1210,75 @@ function retryErrorRows() {
     `성공: ${processed}\n` +
     `실패: ${errors}`
   );
+}
+
+
+/* ═══════════════════════════════════════════════
+   9. v5: 모델 전환
+   ═══════════════════════════════════════════════ */
+
+/**
+ * 메뉴에서 호출: 모델 선택 다이얼로그
+ */
+function switchGeminiModel() {
+  const ui    = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const current = props.getProperty('V_GEMINI_MODEL') || 'gemini-3.5-flash';
+
+  const modelList = Object.entries(MODEL_PRESETS)
+    .map(([id, p], idx) => `  ${idx + 1}) ${id}  — ${p.label}${id === current ? '  ← [현재]' : ''}`)
+    .join('\n');
+
+  const input = ui.prompt(
+    'Gemini 모델 전환',
+    `현재 모델: ${current}\n\n` +
+    `번호를 입력하세요:\n${modelList}`,
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (input.getSelectedButton() !== ui.Button.OK) return;
+
+  const choice = parseInt(input.getResponseText().trim(), 10);
+  const modelIds = Object.keys(MODEL_PRESETS);
+  if (isNaN(choice) || choice < 1 || choice > modelIds.length) {
+    ui.alert('유효하지 않은 번호입니다.');
+    return;
+  }
+
+  const newModel = modelIds[choice - 1];
+  const preset   = MODEL_PRESETS[newModel];
+
+  props.setProperty('V_GEMINI_MODEL', newModel);
+
+  ui.alert(
+    `모델이 전환되었습니다.\n\n` +
+    `${current}  →  ${newModel}\n` +
+    `${preset.label}\n\n` +
+    `⚠️ 이 설정은 다음 검증 실행부터 적용됩니다.\n` +
+    `(VCONFIG.GEMINI_MODEL은 스크립트 재로드 시 반영)`
+  );
+}
+
+/**
+ * 메뉴에서 호출: 현재 모델 확인
+ */
+function showCurrentModel() {
+  const ui    = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const current = props.getProperty('V_GEMINI_MODEL') || 'gemini-3.5-flash';
+  const preset  = MODEL_PRESETS[current] || {};
+
+  const info = [
+    `현재 모델: ${current}`,
+    `설명: ${preset.label || '(프리셋 없음)'}`,
+    `세대: ${preset.gen || '?'}`,
+  ];
+
+  if (preset.gen === '3.x') {
+    info.push(`thinking_level: ${preset.thinkingLevel || 'medium'}`);
+    info.push(`temperature: (사용 안함 — 3.x 기본값 사용)`);
+  } else {
+    info.push(`temperature: ${preset.temperature !== undefined ? preset.temperature : '?'}`);
+  }
+
+  ui.alert('현재 Gemini 모델 설정', info.join('\n'), ui.ButtonSet.OK);
 }

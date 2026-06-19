@@ -4,19 +4,10 @@
   <base target="_top">
   <meta charset="utf-8" />
 
-  <!-- MathJax v3 -->
-  <script>
-    window.MathJax = {
-      tex: {
-        // 혼재된 구분자 대응
-        inlineMath: [['$', '$'], ['\\(', '\\)']],
-        displayMath: [['$$', '$$'], ['\\[', '\\]']],
-        processEscapes: true
-      },
-      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre'] }
-    };
-  </script>
-  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+  <!-- KaTeX (MathJax 대체: 렌더링 속도 향상) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.17.0/dist/contrib/auto-render.min.js"></script>
 
   <style>
     :root{
@@ -174,11 +165,19 @@
     document.getElementById(id).textContent = text ?? "";
   }
 
-  async function typeset(){
-    if (window.MathJax?.typesetPromise) {
-      if (MathJax.typesetClear) MathJax.typesetClear();
-      await MathJax.typesetPromise();
-    }
+  function typeset(){
+    const viewer = document.getElementById("viewer");
+    if (typeof renderMathInElement !== 'function' || !viewer) return;
+    renderMathInElement(viewer, {
+      delimiters: [
+        { left: '$$', right: '$$', display: true },
+        { left: '\\[', right: '\\]', display: true },
+        { left: '$', right: '$', display: false },
+        { left: '\\(', right: '\\)', display: false }
+      ],
+      throwOnError: false,
+      ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+    });
   }
 
   function renderCell(data){

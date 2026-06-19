@@ -8,6 +8,7 @@
  *   - parseRowRange 제거 (MainMenu.gs에서 정의)
  *   - forceStopAll → 통합 키 대응
  *   - v3: HEARTBEAT 키 정리 추가
+ *   - v5: activeWatchdog_ 트리거 정리 추가
  * ============================================================
  */
 
@@ -34,11 +35,11 @@ function forceStopAll() {
   props.setProperty('STOP_REQUESTED', 'true');
   props.setProperty('AUTO_STOP_SIGNAL', 'true');
 
-  // 모든 트리거 제거
+  // 모든 트리거 제거 (v5: activeWatchdog_ 추가)
   const triggers = ScriptApp.getProjectTriggers();
   for (const t of triggers) {
     const fn = t.getHandlerFunction();
-    if (['processVerificationQueue', 'processValidationQueue', 'mainLoop', 'watchdog_'].includes(fn)) {
+    if (['processVerificationQueue', 'processValidationQueue', 'mainLoop', 'watchdog_', 'activeWatchdog_'].includes(fn)) {
       ScriptApp.deleteTrigger(t);
     }
   }
