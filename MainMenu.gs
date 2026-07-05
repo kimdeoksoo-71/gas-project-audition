@@ -29,7 +29,7 @@ function onOpen() {
     .addItem('⏺️ 문항 정규화', 'ds_runNormalizeAndValidate_byRowInput')
     .addSeparator()
     .addItem('▶️ 문항 검증 (문제+해설)', 'startItemVerification')
-    .addItem('🧠 논리 검증 (비약·일관성)', 'startQualityVerification')
+    .addItem('🧠 논리 검증 (비약·일관성)', 'openQualityRunner')
     .addItem('🔄 Error 행 재검증', 'retryErrorRows')
     .addItem('✅ 진행 상태 확인', 'checkVerificationStatus')
     .addItem('🧪 단일 행 테스트', 'testSingleRowVerification')

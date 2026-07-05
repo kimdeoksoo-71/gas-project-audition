@@ -1,7 +1,16 @@
 /**
  * ============================================================
- * QualityVerification.gs — STEP 3: 해설 논리 검증 (v1)
+ * QualityVerification.gs — STEP 3: 해설 논리 검증 (v2)
  * ============================================================
+ * v2 변경사항:
+ *   - 사이드바 실행기(QualityRunner.html) 추가: 행 1건 = 서버 호출 1건 구조로
+ *     GAS 6분 실행 한도를 원천 회피 → 시간 초과 재시작 불필요.
+ *     (Gmail 계정의 트리거 총 실행시간 90분/일 한도를 소모하지 않는
+ *      사용자 상호작용 실행이므로 하루 100건 목표에 적합)
+ *   - 서버 함수: openQualityRunner / qr_start / qr_processRow / qr_finish / qr_requestStop
+ *   - 동시 실행 가드: STEP1·2(V_RUNNING) 진행 중이면 시작 거부
+ *   - 기존 동기 실행(startQualityVerification)은 보조용으로 유지(에디터에서 호출 가능)
+ *
  * 목적:
  *   해설의 '논리적 비약(logic_gap)'과 '일관성 없는 서술(inconsistency)'을
  *   비대칭 교차 검증으로 판정한다.
@@ -50,6 +59,9 @@ const QCONFIG = {
   MAX_EXEC_MS:         Math.round(1000 * 60 * 4.5),  // 4.5분
   ROW_TIME_RESERVE_MS: 120000,   // 행 시작 전 최소 확보 시간(Gemini+Claude 감안)
   API_CALL_RESERVE_MS: 45000,
+
+  /* v2: 사이드바 실행기 — 서버 호출 1건당 1행 처리 예산 (실행당 6분 한도 내 마진) */
+  RUNNER_ROW_BUDGET_MS: 270000,  // 4.5분
 
   /* 재시도 */
   MAX_RETRIES:    5,
@@ -647,4 +659,122 @@ function testSingleQualityRow() {
     `행 ${rowNum} 결과: ${status}\n\nU~X열과 실행 로그(Logger)를 확인하세요.`,
     ui.ButtonSet.OK
   );
+}
+
+
+/* ═══════════════════════════════════════════════
+   6. v2: 사이드바 실행기 (QualityRunner)
+   ═══════════════════════════════════════════════
+   구조: 사이드바 JS가 행 1건당 서버 호출 1건(qr_processRow)을 연쇄 실행.
+   각 호출은 독립적인 실행 예산을 가지므로 6분 한도에 걸리지 않고,
+   사용자 상호작용 실행이라 트리거 일일 한도(90분)도 소모하지 않는다.
+   행 간 쿨다운은 서버측 sleep으로 처리(백그라운드 탭 타이머 스로틀 회피). */
+
+/** 메뉴 호출: 논리 검증 실행기 사이드바 열기 */
+function openQualityRunner() {
+  const html = HtmlService.createHtmlOutputFromFile('QualityRunner')
+    .setTitle('논리 검증 실행기 (STEP 3)')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+/**
+ * 실행 시작: 사전 점검 + 대상 행 선별.
+ * @param {string} rangeText  예: "2-101"
+ * @return {Object} { ok:false, message } 또는
+ *                  { ok:true, targets:number[], skippedDone:number,
+ *                    geminiModel:string, claudeModel:string }
+ */
+function qr_start(rangeText) {
+  const props = PropertiesService.getScriptProperties();
+
+  // 동시 실행 가드: STEP1·2 트리거 체인 진행 중이면 거부
+  if (props.getProperty('V_RUNNING') === 'true') {
+    return { ok: false, message: '문항 검증(STEP 1·2)이 실행 중입니다. 완료 또는 중단 후 시작하세요.' };
+  }
+  if (props.getProperty(QCONFIG.PROP.RUNNING) === 'true') {
+    // 이전 실행이 비정상 종료된 잔재일 수 있음 → 안내 후 초기화하고 진행
+    Logger.log('[Runner] Q_RUNNING 잔재 감지 — 초기화 후 진행');
+  }
+
+  if (!props.getProperty('GEMINI_API_KEY')) return { ok: false, message: 'GEMINI_API_KEY가 설정되지 않았습니다.' };
+  if (!props.getProperty('CLAUDE_API_KEY')) return { ok: false, message: 'CLAUDE_API_KEY가 설정되지 않았습니다.' };
+
+  if (!loadQualityPrompts_()) {
+    return { ok: false, message: '프롬프트 로드 실패. pmt 시트의 quality 세트(key/role/enabled)를 확인하세요.' };
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(QCONFIG.DATA_SHEET);
+  if (!sheet) return { ok: false, message: 'Data_DS 시트를 찾을 수 없습니다.' };
+
+  const range = parseRowRange(rangeText);
+  if (!range || range.startRow < 2) return { ok: false, message: '유효하지 않은 범위입니다. (예: 2-101)' };
+
+  // 대상 행 선별: U열이 비었거나 error/timeout인 행만 (완료 행 건너뛰기)
+  const numRows = range.endRow - range.startRow + 1;
+  const uVals = sheet.getRange(range.startRow, QCONFIG.COL.Q_VERDICT, numRows, 1).getValues();
+  const targets = [];
+  let skippedDone = 0;
+  for (let i = 0; i < numRows; i++) {
+    const u = String(uVals[i][0] || '').toLowerCase().trim();
+    if (u === '' || u === 'error' || u === 'timeout') targets.push(range.startRow + i);
+    else skippedDone++;
+  }
+
+  props.setProperties({
+    [QCONFIG.PROP.STOP]:      'false',
+    [QCONFIG.PROP.RUNNING]:   'true',
+    [QCONFIG.PROP.HEARTBEAT]: String(Date.now()),
+  });
+
+  return {
+    ok: true,
+    targets: targets,
+    skippedDone: skippedDone,
+    geminiModel: QCONFIG.GEMINI_MODEL,
+    claudeModel: QCONFIG.CLAUDE_MODEL,
+  };
+}
+
+/**
+ * 행 1건 처리 (서버 호출 1건 = 독립 실행 예산).
+ * @param {number} row
+ * @param {boolean} isFirst  첫 행이면 행 간 쿨다운 생략
+ * @return {Object} { row, status } — status: ok/fail/check/skip/error/stopped
+ */
+function qr_processRow(row, isFirst) {
+  const props = PropertiesService.getScriptProperties();
+
+  // 중단 확인 (사이드바 STOP 버튼 / 메뉴 '⛔ 논리검증 중단' / forceStopAll 모두 감지)
+  if (props.getProperty(QCONFIG.PROP.STOP) === 'true') {
+    return { row: row, status: 'stopped' };
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(QCONFIG.DATA_SHEET);
+  if (!sheet) return { row: row, status: 'error', message: 'Data_DS 시트를 찾을 수 없습니다.' };
+
+  const qPrompts = loadQualityPrompts_();
+  if (!qPrompts) return { row: row, status: 'error', message: '프롬프트 로드 실패' };
+
+  // 행 간 쿨다운: 서버측 sleep (백그라운드 탭 setTimeout 스로틀 회피)
+  if (!isFirst) Utilities.sleep(QCONFIG.INTER_ROW_COOLDOWN_MS);
+
+  props.setProperty(QCONFIG.PROP.HEARTBEAT, String(Date.now()));
+
+  const status = verifyQualityForRow_(sheet, row, qPrompts, QCONFIG.RUNNER_ROW_BUDGET_MS);
+  SpreadsheetApp.flush();
+
+  return { row: row, status: status };
+}
+
+/** 실행 종료 처리 (완료·중단 공통) */
+function qr_finish() {
+  PropertiesService.getScriptProperties().setProperty(QCONFIG.PROP.RUNNING, 'false');
+  return true;
+}
+
+/** 사이드바 STOP 버튼: Q_STOP 설정 (현재 행 완료 후 정지) */
+function qr_requestStop() {
+  PropertiesService.getScriptProperties().setProperty(QCONFIG.PROP.STOP, 'true');
+  return true;
 }

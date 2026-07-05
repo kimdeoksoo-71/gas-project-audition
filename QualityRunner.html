@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <meta charset="UTF-8" />
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 13px;
+        padding: 12px;
+        line-height: 1.5;
+        background: #f8f9fa;
+        color: #202124;
+      }
+      h3 { margin: 0 0 4px 0; font-size: 15px; }
+      .desc { font-size: 11px; color: #5f6368; margin-bottom: 12px; }
+      .card {
+        background: #fff; border: 1px solid #dadce0; border-radius: 8px;
+        padding: 12px; margin-bottom: 10px;
+      }
+      label { font-size: 11px; color: #5f6368; display: block; margin-bottom: 4px; }
+      input[type=text] {
+        width: 100%; box-sizing: border-box; padding: 8px;
+        border: 1px solid #dadce0; border-radius: 6px; font-size: 14px;
+      }
+      .btn-row { display: flex; gap: 8px; margin-top: 10px; }
+      button {
+        flex: 1; padding: 9px 0; border: none; border-radius: 6px;
+        font-size: 13px; font-weight: 600; cursor: pointer;
+      }
+      button:disabled { opacity: 0.45; cursor: default; }
+      #btnStart { background: #1a73e8; color: #fff; }
+      #btnStop  { background: #d93025; color: #fff; }
+      /* 진행 */
+      #progressWrap { display: none; }
+      .bar-bg {
+        height: 10px; background: #e8eaed; border-radius: 5px; overflow: hidden;
+        margin: 6px 0 8px 0;
+      }
+      #barFill {
+        height: 100%; width: 0%; background: #1a73e8; border-radius: 5px;
+        transition: width 0.3s;
+      }
+      #progText { font-size: 12px; font-weight: 600; }
+      #curRow, #timing { font-size: 11px; color: #5f6368; margin-top: 2px; }
+      /* 카운터 */
+      .counts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+      .chip {
+        font-size: 11px; padding: 2px 8px; border-radius: 10px;
+        background: #e8eaed; color: #3c4043;
+      }
+      .chip.c-ok    { background: #e6f4ea; color: #137333; }
+      .chip.c-fail  { background: #fce8e6; color: #c5221f; }
+      .chip.c-check { background: #fef7e0; color: #b06000; }
+      .chip.c-error { background: #f3e8fd; color: #7627bb; }
+      /* 로그 */
+      #log {
+        background: #fff; border: 1px solid #dadce0; border-radius: 8px;
+        padding: 8px; height: 220px; overflow-y: auto;
+        font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+        white-space: pre-wrap; word-break: break-all;
+      }
+      .log-fail { color: #c5221f; font-weight: 600; }
+      .log-err  { color: #7627bb; }
+      .log-sys  { color: #1a73e8; }
+      #summary {
+        display: none; margin-top: 8px; padding: 10px;
+        border-radius: 8px; background: #e6f4ea; font-size: 12px;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>🧠 논리 검증 실행기</h3>
+    <div class="desc">
+      행 1건 = 서버 호출 1건 구조로 6분 한도 없이 끝까지 자동 실행됩니다.<br>
+      실행 중에는 이 사이드바(탭)를 열어 두세요. U열이 이미 채워진 행
+      (error/timeout 제외)은 자동으로 건너뜁니다.
+    </div>
+
+    <div class="card">
+      <label for="rangeInput">행 범위</label>
+      <input type="text" id="rangeInput" placeholder="예: 2-101" />
+      <div class="btn-row">
+        <button id="btnStart" onclick="startRun()">▶ 시작</button>
+        <button id="btnStop" onclick="requestStop()" disabled>⛔ 중단</button>
+      </div>
+    </div>
+
+    <div class="card" id="progressWrap">
+      <div id="progText">0 / 0</div>
+      <div class="bar-bg"><div id="barFill"></div></div>
+      <div id="curRow">대기 중</div>
+      <div id="timing"></div>
+      <div class="counts">
+        <span class="chip c-ok">ok <b id="cOk">0</b></span>
+        <span class="chip c-fail">fail <b id="cFail">0</b></span>
+        <span class="chip c-check">check <b id="cCheck">0</b></span>
+        <span class="chip">skip <b id="cSkip">0</b></span>
+        <span class="chip c-error">error <b id="cError">0</b></span>
+        <span class="chip">통신실패 <b id="cComm">0</b></span>
+      </div>
+    </div>
+
+    <div id="log"></div>
+    <div id="summary"></div>
+
+    <script>
+      var queue = [];
+      var idx = 0;
+      var running = false;
+      var stopRequested = false;
+      var consecCommFail = 0;
+      var startedAt = 0;
+      var counts = { ok: 0, fail: 0, check: 0, skip: 0, error: 0, stopped: 0 };
+      var commFails = 0;
+      var MAX_CONSEC_COMM_FAIL = 3;
+
+      function $(id) { return document.getElementById(id); }
+
+      function addLog(msg, cls) {
+        var log = $('log');
+        var line = document.createElement('div');
+        if (cls) line.className = cls;
+        var t = new Date();
+        var hh = ('0' + t.getHours()).slice(-2) + ':' + ('0' + t.getMinutes()).slice(-2) + ':' + ('0' + t.getSeconds()).slice(-2);
+        line.textContent = '[' + hh + '] ' + msg;
+        log.appendChild(line);
+        while (log.childNodes.length > 300) log.removeChild(log.firstChild);
+        log.scrollTop = log.scrollHeight;
+      }
+
+      function setUiRunning(on) {
+        running = on;
+        $('btnStart').disabled = on;
+        $('btnStop').disabled = !on;
+        $('rangeInput').disabled = on;
+      }
+
+      function updateProgress() {
+        var done = idx;
+        var total = queue.length;
+        $('progText').textContent = done + ' / ' + total;
+        $('barFill').style.width = (total ? Math.round(done * 100 / total) : 0) + '%';
+        $('cOk').textContent = counts.ok;
+        $('cFail').textContent = counts.fail;
+        $('cCheck').textContent = counts.check;
+        $('cSkip').textContent = counts.skip;
+        $('cError').textContent = counts.error;
+        $('cComm').textContent = commFails;
+
+        if (done > 0) {
+          var elapsedS = Math.round((Date.now() - startedAt) / 1000);
+          var avg = elapsedS / done;
+          var etaMin = Math.ceil(avg * (total - done) / 60);
+          $('timing').textContent =
+            '경과 ' + Math.floor(elapsedS / 60) + '분 ' + (elapsedS % 60) + '초 · ' +
+            '평균 ' + Math.round(avg) + '초/행 · 남은 예상 ' + etaMin + '분';
+        }
+      }
+
+      function startRun() {
+        var rangeText = ($('rangeInput').value || '').trim();
+        if (!rangeText) { alert('행 범위를 입력하세요. (예: 2-101)'); return; }
+
+        setUiRunning(true);
+        $('progressWrap').style.display = 'block';
+        $('summary').style.display = 'none';
+        idx = 0;
+        counts = { ok: 0, fail: 0, check: 0, skip: 0, error: 0, stopped: 0 };
+        commFails = 0;
+        consecCommFail = 0;
+        stopRequested = false;
+        addLog('시작 준비 중... (범위 ' + rangeText + ')', 'log-sys');
+
+        google.script.run
+          .withSuccessHandler(onStarted)
+          .withFailureHandler(function (err) {
+            addLog('시작 실패: ' + (err && err.message ? err.message : err), 'log-fail');
+            setUiRunning(false);
+          })
+          .qr_start(rangeText);
+      }
+
+      function onStarted(res) {
+        if (!res || !res.ok) {
+          addLog('시작 거부: ' + (res && res.message ? res.message : '알 수 없는 오류'), 'log-fail');
+          setUiRunning(false);
+          return;
+        }
+        queue = res.targets || [];
+        startedAt = Date.now();
+        addLog('1차 ' + res.geminiModel + ' → 2차 ' + res.claudeModel, 'log-sys');
+        addLog('대상 ' + queue.length + '행 (이미 완료 ' + res.skippedDone + '행 건너뜀)', 'log-sys');
+        updateProgress();
+
+        if (queue.length === 0) {
+          finishRun('처리할 행이 없습니다.');
+          return;
+        }
+        processNext();
+      }
+
+      function processNext() {
+        if (stopRequested) { finishRun('사용자 중단'); return; }
+        if (idx >= queue.length) { finishRun('완료'); return; }
+
+        var row = queue[idx];
+        $('curRow').textContent = '처리 중: 행 ' + row + ' (최대 수 분 소요)';
+        google.script.run
+          .withSuccessHandler(onRowDone)
+          .withFailureHandler(onRowFail)
+          .qr_processRow(row, idx === 0);
+      }
+
+      function onRowDone(res) {
+        consecCommFail = 0;
+        if (res && res.status === 'stopped') {
+          finishRun('중단 감지 (STOP 버튼 / 메뉴 중단)');
+          return;
+        }
+        var status = (res && res.status) || 'error';
+        if (counts[status] !== undefined) counts[status]++;
+        var cls = status === 'fail' ? 'log-fail' : (status === 'error' ? 'log-err' : '');
+        addLog('행 ' + (res && res.row) + ' → ' + status + (res && res.message ? ' (' + res.message + ')' : ''), cls);
+        idx++;
+        updateProgress();
+        processNext();
+      }
+
+      function onRowFail(err) {
+        // 서버 강제 종료·통신 오류 등: U열 미기록 가능 → 재실행 시 자동 포착됨
+        commFails++;
+        consecCommFail++;
+        addLog('행 ' + queue[idx] + ' 통신/실행 실패: ' + (err && err.message ? err.message : err), 'log-err');
+        if (consecCommFail >= MAX_CONSEC_COMM_FAIL) {
+          finishRun('연속 통신 실패 ' + MAX_CONSEC_COMM_FAIL + '회 — 자동 중단 (네트워크/서비스 상태 확인 후 재시작)');
+          return;
+        }
+        idx++;
+        updateProgress();
+        processNext();
+      }
+
+      function requestStop() {
+        stopRequested = true;
+        $('btnStop').disabled = true;
+        $('curRow').textContent = '중단 요청됨 — 현재 행 완료 후 정지합니다.';
+        addLog('중단 요청 (현재 행 완료 후 정지)', 'log-sys');
+        google.script.run.qr_requestStop();
+      }
+
+      function finishRun(reason) {
+        google.script.run.qr_finish();
+        setUiRunning(false);
+        $('curRow').textContent = reason;
+        var s = $('summary');
+        s.style.display = 'block';
+        s.textContent =
+          '[' + reason + ']\n' +
+          '처리 ' + idx + ' / ' + queue.length + '\n' +
+          'ok ' + counts.ok + ' · fail ' + counts.fail + ' · check ' + counts.check +
+          ' · skip ' + counts.skip + ' · error ' + counts.error + ' · 통신실패 ' + commFails +
+          (counts.fail > 0 ? '\n\nfail 행의 V열(리포트)·W열(감사)을 검토하세요.' : '') +
+          ((counts.error > 0 || commFails > 0) ? '\nerror/미기록 행은 같은 범위 재실행 또는 "Error 행 재검증"으로 처리됩니다.' : '');
+        addLog('=== ' + reason + ' ===', 'log-sys');
+        updateProgress();
+      }
+
+      // Enter로 시작
+      document.getElementById('rangeInput').addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && !running) startRun();
+      });
+    </script>
+  </body>
+</html>
