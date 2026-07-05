@@ -31,6 +31,11 @@ function forceStopAll() {
   props.setProperty('V_RUNNING', 'false');
   props.deleteProperty('V_LAST_HEARTBEAT');  // v3: heartbeat 정리
 
+  // v6: STEP3(논리 검증) 중단 — 트리거 미사용이므로 상태 키만 정리
+  props.setProperty('Q_STOP', 'true');
+  props.setProperty('Q_RUNNING', 'false');
+  props.deleteProperty('Q_LAST_HEARTBEAT');
+
   // 레거시 키도 정리 (혹시 남아있을 경우)
   props.setProperty('STOP_REQUESTED', 'true');
   props.setProperty('AUTO_STOP_SIGNAL', 'true');

@@ -1022,11 +1022,12 @@ function markRowAsTimeout_(row, minutesSince) {
    ═══════════════════════════════════════════════ */
 
 /**
- * 메뉴 호출: 지정 범위 내 N열 또는 Q열이 'error'/'timeout'인 행만 재검증
+ * 메뉴 호출: 지정 범위 내 N열, Q열 또는 U열(STEP3)이 'error'/'timeout'인 행만 재검증
  *
  * - N열만 error/timeout이면 STEP 1만 재실행
  * - Q열만 error/timeout이면 STEP 2만 재실행
- * - 둘 다이면 둘 다 재실행
+ * - U열이 error/timeout이면 STEP 3(논리 검증) 재실행 — verifyQualityForRow_ 재사용
+ * - 복수 해당 시 해당 STEP 모두 재실행
  * - 동기 실행: 시간 초과 시 사용자에게 안내 후 다시 메뉴 실행 권장
  */
 function retryErrorRows() {
@@ -1039,7 +1040,7 @@ function retryErrorRows() {
   const input = ui.prompt(
     'Error/Timeout 행 재검증',
     '재검증할 행 범위를 입력하세요 (예: 2-100)\n' +
-    'N열 또는 Q열이 error 또는 timeout인 행만 재검증됩니다.',
+    'N열, Q열 또는 U열(STEP3)이 error 또는 timeout인 행만 재검증됩니다.',
     ui.ButtonSet.OK_CANCEL
   );
   if (input.getSelectedButton() !== ui.Button.OK) return;
@@ -1054,24 +1055,27 @@ function retryErrorRows() {
   const sheet = ss.getSheetByName(VCONFIG.DATA_SHEET);
   if (!sheet) { ui.alert('Data_DS 시트 없음'); return; }
 
-  // 범위 데이터 일괄 읽기
+  // 범위 데이터 일괄 읽기 (STEP3 통합: 18열 → 21열(U)까지 확장)
   const numRows = range.endRow - range.startRow + 1;
-  const data = sheet.getRange(range.startRow, 1, numRows, 18).getValues();
+  const data = sheet.getRange(range.startRow, 1, numRows, 21).getValues();
 
   // error/timeout 행 추출
   const targets = [];
   for (let i = 0; i < numRows; i++) {
     const nVal = String(data[i][VCONFIG.COL.P_VERDICT - 1] || '').toLowerCase().trim();
     const qVal = String(data[i][VCONFIG.COL.S_VERDICT - 1] || '').toLowerCase().trim();
+    const uVal = String(data[i][QCONFIG.COL.Q_VERDICT - 1] || '').toLowerCase().trim();  // U(21): STEP3
 
     const nIsErr = (nVal === 'error' || nVal === 'timeout');
     const qIsErr = (qVal === 'error' || qVal === 'timeout');
+    const uIsErr = (uVal === 'error' || uVal === 'timeout');
 
-    if (nIsErr || qIsErr) {
+    if (nIsErr || qIsErr || uIsErr) {
       targets.push({
         row: range.startRow + i,
         retryProblem: nIsErr,
         retrySolution: qIsErr,
+        retryQuality: uIsErr,
       });
     }
   }
@@ -1104,6 +1108,21 @@ function retryErrorRows() {
     return;
   }
 
+  // STEP3(U열) 대상이 있으면 STEP3 프롬프트·Claude 키도 사전 점검
+  const needQuality = targets.some(t => t.retryQuality);
+  let qPrompts = null;
+  if (needQuality) {
+    qPrompts = loadQualityPrompts_();   // QualityVerification.gs
+    if (!qPrompts) {
+      ui.alert('STEP3 프롬프트 로드 실패. pmt 시트의 quality 세트(key/role/enabled)를 확인하세요.');
+      return;
+    }
+    if (!PropertiesService.getScriptProperties().getProperty('CLAUDE_API_KEY')) {
+      ui.alert('CLAUDE_API_KEY가 설정되지 않았습니다. (STEP3 재검증에 필요)');
+      return;
+    }
+  }
+
   const startTime = Date.now();
   let processed = 0;
   let errors    = 0;
@@ -1112,9 +1131,12 @@ function retryErrorRows() {
   for (let k = 0; k < targets.length; k++) {
     const t = targets[k];
 
-    // ── 시간 예산 체크 ──
+    // ── 시간 예산 체크 (STEP3 포함 행은 Claude 호출 지연을 감안해 더 큰 예약) ──
+    const rowReserve = t.retryQuality
+      ? Math.max(VCONFIG.ROW_TIME_RESERVE_MS, QCONFIG.ROW_TIME_RESERVE_MS)
+      : VCONFIG.ROW_TIME_RESERVE_MS;
     const remaining = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
-    if (remaining < VCONFIG.ROW_TIME_RESERVE_MS) {
+    if (remaining < rowReserve) {
       ui.alert(
         `시간 제한 근접으로 중단됩니다.\n\n` +
         `처리 완료: ${processed} / ${targets.length}\n` +
@@ -1175,7 +1197,7 @@ function retryErrorRows() {
             .replace(/\{problem\}/g, stem)
             .replace(/\{solution\}/g, solution);
 
-          const stepBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
+          const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / (t.retryQuality ? 2 : 1);
           const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget);
 
           sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
@@ -1183,6 +1205,16 @@ function retryErrorRows() {
             String(sResult.error_report || '').trim(),
           ]]);
         }
+      }
+
+      // ── v6: STEP 3 재검증 (U열 error/timeout — QualityVerification.gs 재사용) ──
+      if (t.retryQuality) {
+        if (t.retryProblem || t.retrySolution) {
+          Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
+        }
+        const qBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
+        // verifyQualityForRow_는 실패 시 내부에서 U='error' 기록 후 'error' 반환 (throw 없음)
+        verifyQualityForRow_(sheet, t.row, qPrompts, qBudget);
       }
 
       processed++;

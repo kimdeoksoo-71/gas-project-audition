@@ -180,12 +180,79 @@
     });
   }
 
+      /* ─────────────────────────────────────────────
+         wrapBareMathDelimiters — bare 수식 $ 감싸기 (표시 전용)
+         ※ 뷰어 3종(ViewerDialog/Sidebar/Index)에 동일 사본 유지
+         규칙:
+          1) 기존 $…$/$$…$$/\(…\)/\[…\] 구간 보호(멱등성)
+          2) 한글은 절대 수식 런에 포함하지 않음
+          3) 수식 신호(연산자·^/_·\명령·함수호출) 있는 런만 감쌈
+          4) 개행은 런에 미포함($…$ 안에 <br>이 끼지 않도록)
+         ───────────────────────────────────────────── */
+      var MATH_WRAP_COLS = { 15:1, 16:1, 18:1, 22:1, 23:1 }; // O,P,R,V,W (E·C 제외)
+
+      function wrapBareMathDelimiters(text) {
+        if (text === null || text === undefined) return '';
+        var s = String(text);
+        if (s.indexOf('\uE000') !== -1) return s;
+
+        var holders = [];
+        s = s.replace(/(\$\$[\s\S]+?\$\$|\$[^$\n]+\$|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\])/g, function (m) {
+          holders.push(m);
+          return String.fromCharCode(0xE000 + (holders.length - 1));
+        });
+
+        var RUN_RE = new RegExp(
+          '(?:' +
+            '\\\\[a-zA-Z]+' +
+            '|\\{[^{}\\uE000-\\uF8FF가-힣ㄱ-ㅎㅏ-ㅣ\\n]*\\}' +
+            '|[A-Za-z0-9.]' +
+            '|[()\\[\\]]' +
+            '|[\\^_]' +
+            '|[=+\\-*/<>≤≥≠±·×÷′°]' +
+            '|,[ \\t](?=[A-Za-z0-9\\\\(])' +
+            '|[ \\t](?=[=+\\-*/<>≤≥≠±·×÷^_\\\\])' +
+            '|(?<=[=+\\-*/<>≤≥≠±·×÷^_])[ \\t]' +
+            '|(?<=\\\\[a-zA-Z]{1,24})[ \\t](?=[A-Za-z0-9({\\\\])' +
+            '|(?<=\\})[ \\t](?=[A-Za-z0-9({\\\\=+\\-])' +
+          ')+',
+          'g'
+        );
+        var SIGNAL_RE = /\\[a-zA-Z]|[\^_]|[A-Za-z0-9)\]}]\s*[=+\-*\/<>≤≥≠±·×÷]\s*[A-Za-z0-9(\\{[]|[A-Za-z]\(|[≤≥≠±×÷′]/;
+
+        s = s.replace(RUN_RE, function (run) {
+          var lead = (run.match(/^[ \t]+/) || [''])[0];
+          var tail = (run.match(/[ \t]+$/) || [''])[0];
+          var core = run.slice(lead.length, run.length - tail.length);
+          if (!core) return run;
+
+          var punct = '';
+          var pm = core.match(/[.,]+$/);
+          if (pm) { punct = pm[0]; core = core.slice(0, core.length - punct.length); }
+          if (!core) return run;
+
+          if (/[\uE000-\uF8FF]/.test(core)) return run;
+          if (!SIGNAL_RE.test(core)) return run;
+          if (/^[A-Za-z]{2,}$/.test(core)) return run;
+
+          return lead + '$' + core + '$' + punct + tail;
+        });
+
+        s = s.replace(/[\uE000-\uF8FF]/g, function (ch) {
+          var idx = ch.charCodeAt(0) - 0xE000;
+          return holders[idx] !== undefined ? holders[idx] : ch;
+        });
+        return s;
+      }
+
   function renderCell(data){
     setText("sheetName", data.sheetName || "");
     setText("cellInfo", `${data.a1 || ""}  (R${data.row}, C${data.col})`);
 
     const viewer = document.getElementById("viewer");
-    viewer.textContent = data.text ?? ""; // ✅ innerHTML 금지
+    // 대상 열(O/P/R/V/W)만 bare 수식 $ 정규화 적용 — 표시 전용, 셀 데이터 불변
+    const raw = data.text ?? "";
+    viewer.textContent = MATH_WRAP_COLS[data.col] ? wrapBareMathDelimiters(raw) : raw; // ✅ innerHTML 금지
     typeset();
   }
 
