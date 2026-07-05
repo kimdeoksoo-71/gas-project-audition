@@ -3,7 +3,7 @@ function addQuestionNumberPrefixToColumnC_byOddEven_InRangeIndex() {
   const sheet = SpreadsheetApp.getActiveSheet();
 
   // 1) 첫행/끝행 입력
-  // 테스트 주석
+  // 테스트 주석 추가
   const r1 = ui.prompt('1/3', '첫행,끝행을 입력하세요 (예: 2,100 또는 2-100)', ui.ButtonSet.OK_CANCEL);
   if (r1.getSelectedButton() !== ui.Button.OK) return;
 
