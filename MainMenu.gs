@@ -41,6 +41,7 @@ function onOpen() {
     .addItem('ℹ️ 현재 모델 확인', 'showCurrentModel')
     .addSeparator()
     .addItem('📦 처리결과 Stack에 저장', 'moveResultsToStack')
+    .addItem('📊 난이도 통계 계산', 'calculateDifficultyStats')   // ← 이 줄 추가
     .addSeparator()
     .addItem('프롬프트를 github에 푸시', 'pushPromptCsvToGithub')
     .addSeparator()
