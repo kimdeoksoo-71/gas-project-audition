@@ -8,6 +8,8 @@
  *   - "처리결과 Stack에 저장" 추가
  *   - parseRowRange를 여기서만 정의 (중복 제거)
  *   - v2: "🔄 Error 행 재검증" 메뉴 추가
+ *   - v3 (2026-09-01): "⚡ 원클릭 파이프라인" 서브메뉴 추가 (PipelineVerify.gs)
+ *                      "🧮 수식 $ 감싸기 (소급)" 메뉴 추가 (LatexWrap.gs)
  * ============================================================
  */
 
@@ -42,6 +44,7 @@ function onOpen() {
     .addSeparator()
     .addItem('📦 처리결과 Stack에 저장', 'moveResultsToStack')
     .addItem('📊 난이도 통계 계산', 'calculateDifficultyStats')   // ← 이 줄 추가
+    .addItem('🧮 수식 $ 감싸기 (소급)', 'lw_wrapExistingMenu')     // v3
     .addSeparator()
     .addItem('프롬프트를 github에 푸시', 'pushPromptCsvToGithub')
     .addSeparator()
@@ -71,8 +74,16 @@ function onOpen() {
     .addSeparator()
     .addItem('SplitN 문제&해설', 'mergeAndSplitLatex');
 
+  // ── 서브메뉴: 원클릭 파이프라인 (v3, PipelineVerify.gs) ──
+  const subMenuP = ui.createMenu('⚡ 원클릭 파이프라인')
+    .addItem('▶️ 파이프라인 시작', 'pv_start')
+    .addItem('⏯ 이어하기', 'pv_resume')
+    .addItem('📋 상태 확인', 'pv_status')
+    .addItem('⏹ 중지', 'pv_stop');
+
   // ── 메인 메뉴 조립 ──
   mainMenu
+    .addSubMenu(subMenuP)
     .addSubMenu(subMenuB)
     .addSubMenu(subMenuA)
     .addSubMenu(subMenuC)

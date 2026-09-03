@@ -107,6 +107,10 @@ const VCONFIG = {
   },
 
   TRIGGER_FN: 'processVerificationQueue',
+
+  /* v6(패치 12): 그림 첨부 — 본문 속 ![이름](Drive링크) 그림을 내려받아 Gemini에 함께 보냄 */
+  ATTACH_IMAGES: true,
+  MAX_IMAGES_PER_CALL: 4,
 };
 
 
@@ -299,13 +303,14 @@ function processVerificationQueue() {
       } else {
         const t1 = Date.now();
         const formatGuide = getFormatGuide(answerType);
+        const imgs1 = iv_imageParts_([stem]);                       // 패치 12
         const userContent = pPrompts.user
           .replace('{problem}', stem)
-          .replace('{format}', formatGuide);
+          .replace('{format}', formatGuide) + iv_imageNote_(imgs1.length);
 
         // v3: 남은 시간의 절반을 STEP 1 예산으로
         const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / 2;
-        const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget);
+        const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget, imgs1);
         totalApiTime += (Date.now() - t1);
 
         // v4: 성공 시 연속 503 카운터 리셋
@@ -338,13 +343,14 @@ function processVerificationQueue() {
           .setValues([['SKIP', 'C열(풀이) 비어있음']]);
       } else {
         const t2 = Date.now();
+        const imgs2 = iv_imageParts_([stem, solution]);             // 패치 12
         const userContent2 = sPrompts.user
           .replace(/\{problem\}/g, stem)
-          .replace(/\{solution\}/g, solution);
+          .replace(/\{solution\}/g, solution) + iv_imageNote_(imgs2.length);
 
         // v3: 남은 시간 전체를 STEP 2 예산으로
         const stepBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
-        const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget);
+        const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget, imgs2);
         totalApiTime += (Date.now() - t2);
 
         // v4: 성공 시 연속 503 카운터 리셋
@@ -435,13 +441,14 @@ function testSingleRowVerification() {
     // ── 문제 검증 ──
     if (stem) {
       const formatGuide = getFormatGuide(answerType);
+      const imgsT1 = iv_imageParts_([stem]);                        // 패치 12
       const userContent = pPrompts.user
         .replace('{problem}', stem)
-        .replace('{format}', formatGuide);
+        .replace('{format}', formatGuide) + iv_imageNote_(imgsT1.length);
 
       const t1 = Date.now();
       // 단일 행 테스트는 충분한 예산(3분) 부여
-      const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, 180000);
+      const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, 180000, imgsT1);   // 패치 12
       Logger.log(`문제검증 (${Date.now() - t1}ms): ${JSON.stringify(pResult)}`);
 
       sheet.getRange(rowNum, VCONFIG.COL.P_VERDICT, 1, 3).setValues([[
@@ -461,12 +468,13 @@ function testSingleRowVerification() {
 
     // ── 해설 검증 ──
     if (solution) {
+      const imgsT2 = iv_imageParts_([stem, solution]);              // 패치 12
       const userContent2 = sPrompts.user
         .replace(/\{problem\}/g, stem)
-        .replace(/\{solution\}/g, solution);
+        .replace(/\{solution\}/g, solution) + iv_imageNote_(imgsT2.length);
 
       const t2 = Date.now();
-      const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, 180000);
+      const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, 180000, imgsT2);   // 패치 12
       Logger.log(`해설검증 (${Date.now() - t2}ms): ${JSON.stringify(sResult)}`);
 
       sheet.getRange(rowNum, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
@@ -532,6 +540,52 @@ function getFormatGuide(type) {
    5. Gemini API
    ═══════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════
+   4.5 (패치 12) 본문 그림을 Gemini 요청에 첨부
+   ═══════════════════════════════════════════════
+   패치 11(변환 파일)이 이관 시 \includegraphics{파일명} 을 ![파일명](Drive링크) 로
+   바꿔 보내므로, 본문에서 그 링크를 찾아 Drive 에서 이미지를 내려받아
+   inline_data 파트로 첨부한다. 실패해도 검증은 텍스트만으로 계속한다. */
+var IV_IMG_CACHE = Object.create(null);   // fileId → part (한 실행 내 재사용)
+
+function iv_imageParts_(texts) {
+  if (!VCONFIG.ATTACH_IMAGES) return [];
+  const urls = [];
+  const re = /!\[[^\]\n]*\]\((https:\/\/drive\.google\.com\/[^)\s]+)\)/g;
+  for (const t of texts) {
+    const str = String(t || '');
+    let m;
+    while ((m = re.exec(str)) !== null) {
+      if (urls.indexOf(m[1]) < 0) urls.push(m[1]);
+    }
+  }
+  const parts = [];
+  for (const u of urls.slice(0, VCONFIG.MAX_IMAGES_PER_CALL)) {
+    try {
+      const id = (u.match(/[-\w]{25,}/) || [])[0];
+      if (!id) continue;
+      if (!IV_IMG_CACHE[id]) {
+        const blob = DriveApp.getFileById(id).getBlob();
+        IV_IMG_CACHE[id] = { inline_data: {
+          mime_type: blob.getContentType() || 'image/jpeg',
+          data: Utilities.base64Encode(blob.getBytes())
+        } };
+      }
+      parts.push(IV_IMG_CACHE[id]);
+    } catch (e) {
+      Logger.log('[패치 12] 그림 첨부 실패(텍스트만으로 계속): ' + u + ' / ' + e.message);
+    }
+  }
+  return parts;
+}
+
+/** 그림이 첨부됐음을 모델에게 알리는 꼬리말 */
+function iv_imageNote_(nParts) {
+  return nParts > 0
+    ? '\n\n(참고: 본문의 ![파일명](링크) 자리에 있던 그림 ' + nParts + '장이 이 요청에 이미지로 첨부되어 있습니다.)'
+    : '';
+}
+
 /**
  * v4: 503 복원력 강화 — 지수 백오프 + 지터, 영구/재시도 에러 구분
  *
@@ -541,12 +595,12 @@ function getFormatGuide(type) {
  * @param {number} timeBudgetMs  이 호출에 허용된 총 시간(ms). undefined면 무제한
  * @return {Object} 파싱된 Gemini 응답
  */
-function callGeminiWithRetry_(sys, usr, ast, timeBudgetMs) {
+function callGeminiWithRetry_(sys, usr, ast, timeBudgetMs, imgParts) {   // 패치 12: imgParts 추가(선택)
   const startedAt = Date.now();
 
   for (let attempt = 0; attempt < VCONFIG.MAX_RETRIES; attempt++) {
     try {
-      return callGeminiUnified_(sys, usr, ast);
+      return callGeminiUnified_(sys, usr, ast, imgParts);
     } catch (e) {
       const errorMsg = e.message || '';
       const isRetryable = is503Error_(errorMsg);
@@ -609,11 +663,12 @@ function is503Error_(errorMsg) {
   return false;
 }
 
-function callGeminiUnified_(sys, usr, ast) {
+function callGeminiUnified_(sys, usr, ast, imgParts) {   // 패치 12: imgParts(inline_data 배열, 선택)
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) throw new Error('GEMINI_API_KEY가 설정되지 않았습니다.');
 
-  const contents = [{ role: 'user', parts: [{ text: usr }] }];
+  const userParts = [{ text: usr }].concat(Array.isArray(imgParts) ? imgParts : []);
+  const contents = [{ role: 'user', parts: userParts }];
   if (ast && ast.trim() !== '') {
     contents.push({ role: 'model', parts: [{ text: ast }] });
   }
@@ -1159,14 +1214,15 @@ function retryErrorRows() {
             .setValues([['skip', '', 'E열(문제) 비어있음']]);
         } else {
           const formatGuide = getFormatGuide(answerType);
+          const imgsR1 = iv_imageParts_([stem]);                    // 패치 12
           const userContent = pPrompts.user
             .replace('{problem}', stem)
-            .replace('{format}', formatGuide);
+            .replace('{format}', formatGuide) + iv_imageNote_(imgsR1.length);
 
           // STEP 1에 남은 시간의 절반 할당 (둘 다 재시도면)
           const split = (t.retryProblem && t.retrySolution) ? 2 : 1;
           const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / split;
-          const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget);
+          const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget, imgsR1);
 
           sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3).setValues([[
             String(pResult.verdict || 'error').toLowerCase(),
@@ -1193,12 +1249,13 @@ function retryErrorRows() {
           sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2)
             .setValues([['SKIP', 'C열(풀이) 비어있음']]);
         } else {
+          const imgsR2 = iv_imageParts_([stem, solution]);          // 패치 12
           const userContent2 = sPrompts.user
             .replace(/\{problem\}/g, stem)
-            .replace(/\{solution\}/g, solution);
+            .replace(/\{solution\}/g, solution) + iv_imageNote_(imgsR2.length);
 
           const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / (t.retryQuality ? 2 : 1);
-          const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget);
+          const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget, imgsR2);
 
           sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
             String(sResult.verdict || 'error').toLowerCase(),

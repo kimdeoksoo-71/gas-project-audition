@@ -37,6 +37,12 @@
  *
  * 재사용(Itemverification.gs의 전역 함수, 수정 없음):
  *   getPromptSet, safeParseGeminiJson_, is503Error_, parseRowRange(MainMenu.gs)
+ *
+ * v3 (패치 12 확장): 그림 첨부
+ *   - 본문(E·C열) 속 ![파일명](Drive링크) 그림을 내려받아 1차 Gemini 에는 inline_data,
+ *     2차 Claude 에는 base64 image 블록으로 함께 보낸다.
+ *   - Itemverification.gs 패치 12 의 iv_imageParts_ / iv_imageNote_ 를 재사용하므로
+ *     그 패치가 먼저 적용되어 있어야 한다 (없으면 조용히 텍스트만으로 동작).
  * ============================================================
  */
 
@@ -266,14 +272,18 @@ function verifyQualityForRow_(sheet, row, qPrompts, budgetMs) {
   }
 
   try {
+    // ── (패치 12 확장) 본문 그림 수집: Itemverification 패치 12 가 있어야 동작 ──
+    const qImgs = (typeof iv_imageParts_ === 'function') ? iv_imageParts_([stem, solution]) : [];
+    const qNote = (typeof iv_imageNote_ === 'function') ? iv_imageNote_(qImgs.length) : '';
+
     // ── [1차] Gemini 후보 생성 ──
     // ★ 함수형 치환 필수: 문자열 치환값의 $$/$& 특수 패턴이 LaTeX를 손상시킴
     const gemUser = qPrompts.gem.user
       .replace(/\{problem\}/g,  function () { return stem; })
-      .replace(/\{solution\}/g, function () { return solution; });
+      .replace(/\{solution\}/g, function () { return solution; }) + qNote;
 
     const gemBudget = Math.max((budgetMs - (Date.now() - rowStart)) / 2, QCONFIG.API_CALL_RESERVE_MS);
-    const gemParsed = callGeminiForQuality_(qPrompts.gem.system, gemUser, qPrompts.gem.assistant, gemBudget);
+    const gemParsed = callGeminiForQuality_(qPrompts.gem.system, gemUser, qPrompts.gem.assistant, gemBudget, qImgs);
 
     // 배열 스키마 필수 검증 (4단계 폴백은 candidates를 모름 → 누락 = 파싱 실패로 간주)
     if (!Array.isArray(gemParsed.candidates)) {
@@ -305,10 +315,10 @@ function verifyQualityForRow_(sheet, row, qPrompts, budgetMs) {
     const judgeUser = qPrompts.judge.user
       .replace(/\{problem\}/g,    function () { return stem; })
       .replace(/\{solution\}/g,   function () { return solution; })
-      .replace(/\{candidates\}/g, function () { return candidatesText; });
+      .replace(/\{candidates\}/g, function () { return candidatesText; }) + qNote;
 
     const claudeBudget = budgetMs - (Date.now() - rowStart);
-    const judgeParsed = callClaudeWithRetry_(qPrompts.judge.system, judgeUser, claudeBudget);
+    const judgeParsed = callClaudeWithRetry_(qPrompts.judge.system, judgeUser, claudeBudget, q_claudeImageBlocks_(qImgs));
 
     if (!Array.isArray(judgeParsed.judgments)) {
       throw new Error('Claude 응답에서 judgments 배열을 파싱하지 못했습니다.');
@@ -440,12 +450,12 @@ function synthesizeQuality_(candidates, judgments, truncNote) {
    STEP3의 "1차 = 3.1 Pro 고정" 원칙을 위해 전용 호출기를 둔다.
    safeParseGeminiJson_ / is503Error_ 는 전역 함수라 그대로 재사용. */
 
-function callGeminiForQuality_(sys, usr, ast, timeBudgetMs) {
+function callGeminiForQuality_(sys, usr, ast, timeBudgetMs, imgParts) {   // 패치 12: imgParts(선택)
   const startedAt = Date.now();
 
   for (let attempt = 0; attempt < QCONFIG.MAX_RETRIES; attempt++) {
     try {
-      return callGeminiForQualityOnce_(sys, usr, ast);
+      return callGeminiForQualityOnce_(sys, usr, ast, imgParts);
     } catch (e) {
       const errorMsg = e.message || '';
       const isRetryable = is503Error_(errorMsg);
@@ -468,11 +478,12 @@ function callGeminiForQuality_(sys, usr, ast, timeBudgetMs) {
   }
 }
 
-function callGeminiForQualityOnce_(sys, usr, ast) {
+function callGeminiForQualityOnce_(sys, usr, ast, imgParts) {   // 패치 12: imgParts(선택)
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) throw new Error('GEMINI_API_KEY가 설정되지 않았습니다.');
 
-  const contents = [{ role: 'user', parts: [{ text: usr }] }];
+  const userParts = [{ text: usr }].concat(Array.isArray(imgParts) ? imgParts : []);
+  const contents = [{ role: 'user', parts: userParts }];
   if (ast && ast.trim() !== '') contents.push({ role: 'model', parts: [{ text: ast }] });
 
   const payload = {
@@ -514,12 +525,25 @@ function callGeminiForQualityOnce_(sys, usr, ast) {
  * 재시도 대상: 529(overloaded), 429, 500, 502, 503, 504
  * 즉시 중단: credit/billing 계열, 인증/요청 형식 오류(400/401/403/404)
  */
-function callClaudeWithRetry_(sys, usr, timeBudgetMs) {
+/** (패치 12 확장) Gemini inline_data 파트 → Claude image 블록 변환 */
+function q_claudeImageBlocks_(gemParts) {
+  if (!Array.isArray(gemParts)) return [];
+  return gemParts
+    .filter(function (p) { return p && p.inline_data && p.inline_data.data; })
+    .map(function (p) {
+      return { type: 'image',
+               source: { type: 'base64',
+                         media_type: p.inline_data.mime_type || 'image/jpeg',
+                         data: p.inline_data.data } };
+    });
+}
+
+function callClaudeWithRetry_(sys, usr, timeBudgetMs, imgBlocks) {   // 패치 12: imgBlocks(선택)
   const startedAt = Date.now();
 
   for (let attempt = 0; attempt < QCONFIG.MAX_RETRIES; attempt++) {
     try {
-      return callClaudeUnified_(sys, usr);
+      return callClaudeUnified_(sys, usr, imgBlocks);
     } catch (e) {
       const errorMsg = e.message || '';
       const isRetryable = isClaudeRetryable_(errorMsg);
@@ -570,9 +594,13 @@ function isClaudeRetryable_(errorMsg) {
  * - temperature 등 샘플링 파라미터 설정 금지(400 반환)
  * - 응답 content에서 type:"text" 블록만 취합 (thinking 블록 무시)
  */
-function callClaudeUnified_(sys, usr) {
+function callClaudeUnified_(sys, usr, imgBlocks) {   // 패치 12: imgBlocks(선택)
   const apiKey = PropertiesService.getScriptProperties().getProperty('CLAUDE_API_KEY');
   if (!apiKey) throw new Error('CLAUDE_API_KEY가 설정되지 않았습니다.');
+
+  const content = (Array.isArray(imgBlocks) && imgBlocks.length > 0)
+    ? [{ type: 'text', text: usr }].concat(imgBlocks)
+    : usr;
 
   const payload = {
     model: QCONFIG.CLAUDE_MODEL,
@@ -580,7 +608,7 @@ function callClaudeUnified_(sys, usr) {
     system: sys,
     thinking: { type: 'adaptive' },
     output_config: { effort: QCONFIG.CLAUDE_EFFORT },
-    messages: [{ role: 'user', content: usr }],
+    messages: [{ role: 'user', content: content }],
   };
 
   const resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {

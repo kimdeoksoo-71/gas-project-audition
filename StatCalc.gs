@@ -91,30 +91,47 @@ const STATCONFIG = {
 
 function calculateDifficultyStats() {
   const ui = SpreadsheetApp.getUi();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
 
+  const res = stat_core_();
+  if (!res.ok) { ui.alert(res.message); return; }
+
+  ui.alert(
+    '📊 난이도 통계 계산 완료',
+    `인식된 연속 구간: ${res.runs}개\n` +
+    `세트로 집계됨 (유효 문항 ${STATCONFIG.MIN_SET_SIZE}개 이상): ${res.sets}개\n` +
+    `기준 미달로 제외: ${res.skipped}개\n\n` +
+    `Stat 시트 ${STATCONFIG.DST_START_ROW}행부터 ` +
+    `${res.sets}개 행이 기록되었습니다.\n` +
+    `(Z열 총합은 E~T열 그룹(공통+확통+미적)만 포함, 기하 제외)`,
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * v3: 헤드리스 코어 — UI 없이 Stack 전체를 재집계해 Stat 3행 이하에 기록.
+ * 원클릭 파이프라인(PipelineVerify.gs)에서 직접 호출.
+ * @return {{ok:boolean, message:string, runs:number, sets:number, skipped:number}}
+ */
+function stat_core_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const src = ss.getSheetByName(STATCONFIG.SRC_SHEET);
   const dst = ss.getSheetByName(STATCONFIG.DST_SHEET);
 
-  if (!src) { ui.alert(`'${STATCONFIG.SRC_SHEET}' 시트를 찾을 수 없습니다.`); return; }
-  if (!dst) { ui.alert(`'${STATCONFIG.DST_SHEET}' 시트를 찾을 수 없습니다.`); return; }
+  const fail = (msg) => ({ ok: false, message: msg, runs: 0, sets: 0, skipped: 0 });
+
+  if (!src) return fail(`'${STATCONFIG.SRC_SHEET}' 시트를 찾을 수 없습니다.`);
+  if (!dst) return fail(`'${STATCONFIG.DST_SHEET}' 시트를 찾을 수 없습니다.`);
 
   // Stack에 Y/Z열이 존재하는지 방어적 확인
   if (src.getMaxColumns() < STATCONFIG.SRC_COL.GROUP) {
-    ui.alert(
-      'Stack 시트 열 부족',
+    return fail(
       `Stack 시트에 Z열(문항그룹)까지 존재해야 합니다.\n` +
-      `현재 최대 열: ${src.getMaxColumns()} / 필요: ${STATCONFIG.SRC_COL.GROUP}`,
-      ui.ButtonSet.OK
+      `현재 최대 열: ${src.getMaxColumns()} / 필요: ${STATCONFIG.SRC_COL.GROUP}`
     );
-    return;
   }
 
   const srcLastRow = src.getLastRow();
-  if (srcLastRow < 2) {
-    ui.alert('Stack 시트에 데이터가 없습니다. (2행 이하 비어있음)');
-    return;
-  }
+  if (srcLastRow < 2) return fail('Stack 시트에 데이터가 없습니다. (2행 이하 비어있음)');
 
   // ── 1. Stack 일괄 읽기 (A~Z, 2행부터) ──
   const numRows = srcLastRow - 1;
@@ -151,20 +168,10 @@ function calculateDifficultyStats() {
       STATCONFIG.DST_NUM_COLS
     ).setValues(statRows);
   }
+  SpreadsheetApp.flush();
 
-  // ── 6. 완료 안내 ──
-  ui.alert(
-    '📊 난이도 통계 계산 완료',
-    `인식된 연속 구간: ${runs.length}개\n` +
-    `세트로 집계됨 (유효 문항 ${STATCONFIG.MIN_SET_SIZE}개 이상): ${statRows.length}개\n` +
-    `기준 미달로 제외: ${skippedRuns}개\n\n` +
-    `Stat 시트 ${STATCONFIG.DST_START_ROW}행부터 ` +
-    `${statRows.length}개 행이 기록되었습니다.\n` +
-    `(Z열 총합은 E~T열 그룹(공통+확통+미적)만 포함, 기하 제외)`,
-    ui.ButtonSet.OK
-  );
-
-  Logger.log(`StatCalc v2: runs=${runs.length}, sets=${statRows.length}, skipped=${skippedRuns}`);
+  Logger.log(`StatCalc v3: runs=${runs.length}, sets=${statRows.length}, skipped=${skippedRuns}`);
+  return { ok: true, message: '', runs: runs.length, sets: statRows.length, skipped: skippedRuns };
 }
 
 
