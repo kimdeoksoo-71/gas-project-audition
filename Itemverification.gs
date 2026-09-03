@@ -110,7 +110,19 @@ const VCONFIG = {
 
   /* v6(패치 12): 그림 첨부 — 본문 속 ![이름](Drive링크) 그림을 내려받아 Gemini에 함께 보냄 */
   ATTACH_IMAGES: true,
-  MAX_IMAGES_PER_CALL: 4,
+
+  /* v7(패치 13, 2026-09-03): 상한·누락 고지·구형 태그 fallback — 체크리스트 ⑥⑦② 확정
+   *  - 행당 최대 8장, 장당 4MB, 요청당 합계 16MB (Gemini 인라인 20MB 한도 방어)
+   *  - 못 찾은/제외된 그림은 프롬프트 꼬리말에 [그림: 이름 — 사유] 로 고지 (모델이 skip/check 판단)
+   *  - 링크 없는 구형 \includegraphics{파일명} 은 Drive 폴더(FIG_FOLDER_PATH)에서 이름으로 검색 */
+  MAX_IMAGES_PER_CALL: 8,
+  MAX_IMAGE_BYTES:        4 * 1024 * 1024,
+  MAX_TOTAL_IMAGE_BYTES: 16 * 1024 * 1024,
+  IMAGE_MIME_OK: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
+  FIG_FOLDER_PROP:    'FIG_FOLDER_PATH',       // 스크립트 속성으로 변경 가능
+  FIG_FOLDER_DEFAULT: 'PBMAI/IMAGE_FIG',
+
+  COL_FIG_INFO: 25,   // Y  행별 그림 첨부/누락 내역 (패치 13)
 };
 
 
@@ -223,6 +235,7 @@ function processVerificationQueue() {
   const ss    = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(VCONFIG.DATA_SHEET);
   if (!sheet) { finishVerification_('Data_DS 시트 없음'); return; }
+  iv_ensureFigInfoHeader_(sheet);   // 패치 13: Y1 헤더 보장
 
   let currentRow = parseInt(props.getProperty(VCONFIG.PROP.CURRENT), 10);
   const endRow   = parseInt(props.getProperty(VCONFIG.PROP.END), 10);
@@ -288,6 +301,7 @@ function processVerificationQueue() {
     const stem       = String(row[VCONFIG.COL.STEM - 1]        || '').trim();   // E
     const solution   = String(row[VCONFIG.COL.SOLUTION - 1]    || '').trim();   // C
     const answerType = String(row[VCONFIG.COL.ANSWER_TYPE - 1] || '').trim();   // K
+    let rowImgs = null;   // 패치 13: 이 행에서 마지막으로 수집한 그림 정보 (Y열 기록용)
 
     try {
       // 상태 표시
@@ -303,10 +317,11 @@ function processVerificationQueue() {
       } else {
         const t1 = Date.now();
         const formatGuide = getFormatGuide(answerType);
-        const imgs1 = iv_imageParts_([stem]);                       // 패치 12
+        const imgs1 = iv_imageParts_([stem]);                       // 패치 12·13
+        rowImgs = imgs1;
         const userContent = pPrompts.user
           .replace('{problem}', stem)
-          .replace('{format}', formatGuide) + iv_imageNote_(imgs1.length);
+          .replace('{format}', formatGuide) + iv_imageNote_(imgs1);
 
         // v3: 남은 시간의 절반을 STEP 1 예산으로
         const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / 2;
@@ -343,10 +358,11 @@ function processVerificationQueue() {
           .setValues([['SKIP', 'C열(풀이) 비어있음']]);
       } else {
         const t2 = Date.now();
-        const imgs2 = iv_imageParts_([stem, solution]);             // 패치 12
+        const imgs2 = iv_imageParts_([stem, solution]);             // 패치 12·13
+        rowImgs = imgs2;
         const userContent2 = sPrompts.user
           .replace(/\{problem\}/g, stem)
-          .replace(/\{solution\}/g, solution) + iv_imageNote_(imgs2.length);
+          .replace(/\{solution\}/g, solution) + iv_imageNote_(imgs2);
 
         // v3: 남은 시간 전체를 STEP 2 예산으로
         const stepBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
@@ -361,6 +377,11 @@ function processVerificationQueue() {
 
         sheet.getRange(currentRow, VCONFIG.COL.S_VERDICT, 1, 2)
           .setValues([[sVerdict, sError]]);
+      }
+
+      // ── 패치 13: Y열(fig_info)에 그림 첨부/누락 내역 기록 ──
+      if (rowImgs !== null) {
+        sheet.getRange(currentRow, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(rowImgs));
       }
 
       // ── v3: 행 완료 시 heartbeat 갱신 ──
@@ -424,6 +445,7 @@ function testSingleRowVerification() {
   const ss    = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(VCONFIG.DATA_SHEET);
   if (!sheet) { ui.alert('Data_DS 시트 없음'); return; }
+  iv_ensureFigInfoHeader_(sheet);   // 패치 13
 
   const stem       = String(sheet.getRange(rowNum, VCONFIG.COL.STEM).getValue() || '').trim();
   const solution   = String(sheet.getRange(rowNum, VCONFIG.COL.SOLUTION).getValue() || '').trim();
@@ -441,10 +463,11 @@ function testSingleRowVerification() {
     // ── 문제 검증 ──
     if (stem) {
       const formatGuide = getFormatGuide(answerType);
-      const imgsT1 = iv_imageParts_([stem]);                        // 패치 12
+      const imgsT1 = iv_imageParts_([stem]);                        // 패치 12·13
+      sheet.getRange(rowNum, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(imgsT1));
       const userContent = pPrompts.user
         .replace('{problem}', stem)
-        .replace('{format}', formatGuide) + iv_imageNote_(imgsT1.length);
+        .replace('{format}', formatGuide) + iv_imageNote_(imgsT1);
 
       const t1 = Date.now();
       // 단일 행 테스트는 충분한 예산(3분) 부여
@@ -468,10 +491,11 @@ function testSingleRowVerification() {
 
     // ── 해설 검증 ──
     if (solution) {
-      const imgsT2 = iv_imageParts_([stem, solution]);              // 패치 12
+      const imgsT2 = iv_imageParts_([stem, solution]);              // 패치 12·13
+      sheet.getRange(rowNum, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(imgsT2));
       const userContent2 = sPrompts.user
         .replace(/\{problem\}/g, stem)
-        .replace(/\{solution\}/g, solution) + iv_imageNote_(imgsT2.length);
+        .replace(/\{solution\}/g, solution) + iv_imageNote_(imgsT2);
 
       const t2 = Date.now();
       const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, 180000, imgsT2);   // 패치 12
@@ -541,49 +565,174 @@ function getFormatGuide(type) {
    ═══════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════════
-   4.5 (패치 12) 본문 그림을 Gemini 요청에 첨부
+   4.5 (패치 12→13) 본문 그림을 Gemini 요청에 첨부
    ═══════════════════════════════════════════════
    패치 11(변환 파일)이 이관 시 \includegraphics{파일명} 을 ![파일명](Drive링크) 로
    바꿔 보내므로, 본문에서 그 링크를 찾아 Drive 에서 이미지를 내려받아
-   inline_data 파트로 첨부한다. 실패해도 검증은 텍스트만으로 계속한다. */
-var IV_IMG_CACHE = Object.create(null);   // fileId → part (한 실행 내 재사용)
+   inline_data 파트로 첨부한다. 실패해도 검증은 텍스트만으로 계속한다.
 
-function iv_imageParts_(texts) {
-  if (!VCONFIG.ATTACH_IMAGES) return [];
-  const urls = [];
-  const re = /!\[[^\]\n]*\]\((https:\/\/drive\.google\.com\/[^)\s]+)\)/g;
+   패치 13 (2026-09-03):
+   - 상한: 행당 MAX_IMAGES_PER_CALL장, 장당 MAX_IMAGE_BYTES, 합계 MAX_TOTAL_IMAGE_BYTES
+   - 지원 형식(IMAGE_MIME_OK) 외(svg 등)는 제외하고 사유와 함께 '누락'으로 기록
+   - 링크 없는 구형 \includegraphics{파일명} 도 인식: Drive 폴더(FIG_FOLDER_PATH,
+     기본 PBMAI/IMAGE_FIG)에서 이름으로 검색, 없으면 Drive 전체 이름 검색
+   - 반환 배열에 ._attached(첨부 파일명[])와 ._missing(제외 "이름 — 사유"[]) 를 실어
+     iv_imageNote_(프롬프트 꼬리말)·iv_figInfo_(Y열 기록)가 사용 */
+var IV_IMG_CACHE  = Object.create(null);   // fileId → { part, size } (한 실행 내 재사용)
+var IV_NAME_CACHE = Object.create(null);   // 파일명 → fileId | '' (폴더 검색 결과)
+var IV_FIG_FOLDER;                          // 폴더 핸들 (지연 초기화; null=못 찾음)
+
+/** 본문들에서 그림 참조 수집 → [{name, id|null}] (등장 순서, 이름 기준 중복 제거) */
+function iv_collectFigRefs_(texts) {
+  const refs = [], seen = Object.create(null);
+  const push = (name, id) => {
+    const key = String(name || '').trim() || ('#' + (id || ''));
+    if (!key || seen[key]) return;
+    seen[key] = true;
+    refs.push({ name: String(name || '').trim() || id, id: id || null });
+  };
+  const reLink = /!\[([^\]\n]*)\]\((https:\/\/drive\.google\.com\/[^)\s]+)\)/g;
+  const reTag  = /\\includegraphics\s*\{([^}]+)\}/g;
   for (const t of texts) {
     const str = String(t || '');
     let m;
-    while ((m = re.exec(str)) !== null) {
-      if (urls.indexOf(m[1]) < 0) urls.push(m[1]);
+    while ((m = reLink.exec(str)) !== null) {
+      push(m[1], (m[2].match(/[-\w]{25,}/) || [])[0] || null);
     }
+    while ((m = reTag.exec(str)) !== null) push(m[1], null);   // 구형: 이름만
   }
+  return refs;
+}
+
+/** 구형 태그용: 파일명 → fileId (폴더 우선, 없으면 Drive 전체 이름 검색) */
+function iv_findFigIdByName_(name) {
+  if (name in IV_NAME_CACHE) return IV_NAME_CACHE[name];
+  let id = '';
+  try {
+    if (IV_FIG_FOLDER === undefined) {
+      IV_FIG_FOLDER = null;
+      const sp = PropertiesService.getScriptProperties();
+      const path = (sp.getProperty(VCONFIG.FIG_FOLDER_PROP) || VCONFIG.FIG_FOLDER_DEFAULT)
+        .replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      let cur = DriveApp.getRootFolder();
+      for (const part of path.split('/')) {
+        const it = cur.getFoldersByName(part);
+        if (!it.hasNext()) { cur = null; break; }
+        cur = it.next();
+      }
+      IV_FIG_FOLDER = cur;
+    }
+    if (IV_FIG_FOLDER) {
+      const it = IV_FIG_FOLDER.getFilesByName(name);
+      if (it.hasNext()) id = it.next().getId();
+    }
+    if (!id) {
+      const it2 = DriveApp.getFilesByName(name);
+      if (it2.hasNext()) id = it2.next().getId();
+    }
+  } catch (e) {
+    Logger.log('[패치 13] 이름 검색 실패: ' + name + ' / ' + e.message);
+  }
+  IV_NAME_CACHE[name] = id;
+  return id;
+}
+
+/**
+ * 본문 그림 → Gemini inline_data 파트 배열.
+ * 배열에 ._attached / ._missing 메타를 실어 반환 (concat 시 메타는 복사되지 않으나
+ * 호출 직후 iv_imageNote_/iv_figInfo_ 에서만 쓰므로 무방).
+ */
+function iv_imageParts_(texts) {
   const parts = [];
-  for (const u of urls.slice(0, VCONFIG.MAX_IMAGES_PER_CALL)) {
+  parts._attached = [];
+  parts._missing = [];
+  if (!VCONFIG.ATTACH_IMAGES) return parts;
+
+  const refs = iv_collectFigRefs_(texts);
+  let totalBytes = 0;
+
+  for (const ref of refs) {
+    if (parts.length >= VCONFIG.MAX_IMAGES_PER_CALL) {
+      parts._missing.push(ref.name + ' — 행당 ' + VCONFIG.MAX_IMAGES_PER_CALL + '장 상한 초과');
+      continue;
+    }
     try {
-      const id = (u.match(/[-\w]{25,}/) || [])[0];
-      if (!id) continue;
+      const id = ref.id || iv_findFigIdByName_(ref.name);
+      if (!id) { parts._missing.push(ref.name + ' — 파일 없음'); continue; }
+
       if (!IV_IMG_CACHE[id]) {
         const blob = DriveApp.getFileById(id).getBlob();
-        IV_IMG_CACHE[id] = { inline_data: {
-          mime_type: blob.getContentType() || 'image/jpeg',
-          data: Utilities.base64Encode(blob.getBytes())
-        } };
+        const mime = String(blob.getContentType() || 'image/jpeg').toLowerCase();
+        const bytes = blob.getBytes();
+        IV_IMG_CACHE[id] = {
+          size: bytes.length,
+          mime: mime,
+          part: { inline_data: { mime_type: mime, data: Utilities.base64Encode(bytes) } },
+        };
       }
-      parts.push(IV_IMG_CACHE[id]);
+      const c = IV_IMG_CACHE[id];
+      if (VCONFIG.IMAGE_MIME_OK.indexOf(c.mime) < 0) {
+        parts._missing.push(ref.name + ' — 지원되지 않는 형식(' + c.mime + ')'); continue;
+      }
+      if (c.size > VCONFIG.MAX_IMAGE_BYTES) {
+        parts._missing.push(ref.name + ' — 장당 4MB 초과'); continue;
+      }
+      if (totalBytes + c.size > VCONFIG.MAX_TOTAL_IMAGE_BYTES) {
+        parts._missing.push(ref.name + ' — 요청 용량 한도 초과'); continue;
+      }
+      totalBytes += c.size;
+      parts.push(c.part);
+      parts._attached.push(ref.name);
     } catch (e) {
-      Logger.log('[패치 12] 그림 첨부 실패(텍스트만으로 계속): ' + u + ' / ' + e.message);
+      parts._missing.push(ref.name + ' — 로드 실패');
+      Logger.log('[패치 13] 그림 첨부 실패(텍스트만으로 계속): ' + ref.name + ' / ' + e.message);
     }
   }
   return parts;
 }
 
-/** 그림이 첨부됐음을 모델에게 알리는 꼬리말 */
-function iv_imageNote_(nParts) {
-  return nParts > 0
-    ? '\n\n(참고: 본문의 ![파일명](링크) 자리에 있던 그림 ' + nParts + '장이 이 요청에 이미지로 첨부되어 있습니다.)'
-    : '';
+/**
+ * 그림 첨부/누락을 모델에게 알리는 꼬리말.
+ * 패치 13: iv_imageParts_ 반환 배열을 그대로 받는다 (숫자를 주는 옛 호출도 동작).
+ */
+function iv_imageNote_(imgs) {
+  if (typeof imgs === 'number') {   // 하위 호환
+    return imgs > 0
+      ? '\n\n(참고: 본문의 ![파일명](링크) 자리에 있던 그림 ' + imgs + '장이 이 요청에 이미지로 첨부되어 있습니다.)'
+      : '';
+  }
+  const attached = (imgs && imgs._attached) || [];
+  const missing  = (imgs && imgs._missing)  || [];
+  if (!attached.length && !missing.length) return '';
+  let note = '\n';
+  if (attached.length) {
+    note += '\n(참고: 본문의 그림 ' + attached.length + '장이 이 요청에 이미지로 첨부되어 있습니다: ' +
+            attached.join(', ') + ')';
+  }
+  for (const m of missing) note += '\n[그림: ' + m + ' — 첨부되지 않음]';
+  return note;
+}
+
+/** 패치 13: Y열(fig_info)에 기록할 행별 첨부/누락 요약. 그림 참조가 없으면 '' */
+function iv_figInfo_(imgs) {
+  const attached = (imgs && imgs._attached) || [];
+  const missing  = (imgs && imgs._missing)  || [];
+  if (!attached.length && !missing.length) return '';
+  const bits = [];
+  if (attached.length) bits.push('첨부 ' + attached.length + '장: ' + attached.join(', '));
+  if (missing.length)  bits.push('누락 ' + missing.length + '장: ' + missing.join(' / '));
+  return bits.join('\n');
+}
+
+/** 패치 13: Y1 헤더 보장 (비어 있을 때만) */
+function iv_ensureFigInfoHeader_(sheet) {
+  try {
+    if (sheet.getMaxColumns() < VCONFIG.COL_FIG_INFO) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(), VCONFIG.COL_FIG_INFO - sheet.getMaxColumns());
+    }
+    const cell = sheet.getRange(1, VCONFIG.COL_FIG_INFO);
+    if (!String(cell.getValue() || '').trim()) cell.setValue('fig_info');
+  } catch (_) {}
 }
 
 /**
@@ -1109,6 +1258,7 @@ function retryErrorRows() {
   const ss    = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(VCONFIG.DATA_SHEET);
   if (!sheet) { ui.alert('Data_DS 시트 없음'); return; }
+  iv_ensureFigInfoHeader_(sheet);   // 패치 13
 
   // 범위 데이터 일괄 읽기 (STEP3 통합: 18열 → 21열(U)까지 확장)
   const numRows = range.endRow - range.startRow + 1;
@@ -1214,10 +1364,11 @@ function retryErrorRows() {
             .setValues([['skip', '', 'E열(문제) 비어있음']]);
         } else {
           const formatGuide = getFormatGuide(answerType);
-          const imgsR1 = iv_imageParts_([stem]);                    // 패치 12
+          const imgsR1 = iv_imageParts_([stem]);                    // 패치 12·13
+          sheet.getRange(t.row, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(imgsR1));
           const userContent = pPrompts.user
             .replace('{problem}', stem)
-            .replace('{format}', formatGuide) + iv_imageNote_(imgsR1.length);
+            .replace('{format}', formatGuide) + iv_imageNote_(imgsR1);
 
           // STEP 1에 남은 시간의 절반 할당 (둘 다 재시도면)
           const split = (t.retryProblem && t.retrySolution) ? 2 : 1;
@@ -1249,10 +1400,11 @@ function retryErrorRows() {
           sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2)
             .setValues([['SKIP', 'C열(풀이) 비어있음']]);
         } else {
-          const imgsR2 = iv_imageParts_([stem, solution]);          // 패치 12
+          const imgsR2 = iv_imageParts_([stem, solution]);          // 패치 12·13
+          sheet.getRange(t.row, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(imgsR2));
           const userContent2 = sPrompts.user
             .replace(/\{problem\}/g, stem)
-            .replace(/\{solution\}/g, solution) + iv_imageNote_(imgsR2.length);
+            .replace(/\{solution\}/g, solution) + iv_imageNote_(imgsR2);
 
           const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / (t.retryQuality ? 2 : 1);
           const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget, imgsR2);

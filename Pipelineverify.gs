@@ -8,13 +8,13 @@
  *
  *  단계(stage)
  *   1. load    : Latex변환 파일 Data_DS!A열 키워드 검색(A~K)
- *                → 문제검토 Data_DS 초기화(A~X) 후 붙여넣기
+ *                → 문제검토 Data_DS 초기화(A~AC) 후 붙여넣기
  *                ※ 검색·붙여넣기는 한 실행에서 원자적 수행
  *   2. verify  : 기존 문항 검증 트리거 체인(processVerificationQueue)
  *                시작 → 1분 간격 폴링으로 완료 대기 (+정체 자동 복구)
  *   3. retry   : N/Q열 error·timeout 행 헤드리스 재검증 (최대 2라운드)
  *   4. quality : STEP3 논리 검증 행 단위 루프 (전체 1패스 + error 1패스)
- *   5. stack   : Stack 저장 + Y(세트명)/Z(문항그룹) 자동 기입 (mts_core_)
+ *   5. stack   : Stack 저장 + AD(세트명)/AE(문항그룹) 자동 기입 (mts_core_ v4)
  *   6. stats   : 난이도 통계 재집계 (stat_core_)
  *   7. done    : Pipeline_Log 최종 요약 (메일 없음 — D7 결정)
  *
@@ -45,7 +45,7 @@ const PV = {
 
   DATA_SHEET: 'Data_DS',
   LOG_SHEET:  'Pipeline_Log',
-  NUM_COLS:   24,               // A~X
+  NUM_COLS:   29,               // A~AC (v4: Y=fig_info, Z~AC 여유 열 포함)
 
   TIME_BUDGET_MS:  4 * 60 * 1000,   // tick 한 번의 시간 예산
   RESUME_AFTER_MS: 60 * 1000,       // yield 후 이어하기 지연
@@ -472,7 +472,7 @@ function pv_latexFileId_() {
 
 /**
  * load: Latex변환 Data_DS!A~K에서 키워드 포함 행 검색 →
- * 문제검토 Data_DS 초기화(A~X) 후 A~K 붙여넣기
+ * 문제검토 Data_DS 초기화(A~AC) 후 A~K 붙여넣기
  */
 function pv_load_(ss, keywords) {
   const srcSs = SpreadsheetApp.openById(pv_latexFileId_());
@@ -503,8 +503,11 @@ function pv_load_(ss, keywords) {
 
   const dst = ss.getSheetByName(PV.DATA_SHEET);
   if (!dst) throw new Error('문제검토 Data_DS 시트를 찾을 수 없습니다.');
+  if (dst.getMaxColumns() < PV.NUM_COLS) {   // v4: A~AC 폭 보장
+    dst.insertColumnsAfter(dst.getMaxColumns(), PV.NUM_COLS - dst.getMaxColumns());
+  }
   const maxRows = dst.getMaxRows();
-  if (maxRows >= 2) dst.getRange(2, 1, maxRows - 1, PV.NUM_COLS).clearContent();   // A~X 전체 클리어
+  if (maxRows >= 2) dst.getRange(2, 1, maxRows - 1, PV.NUM_COLS).clearContent();   // A~AC 전체 클리어 (v4)
   if (rowsOut.length) dst.getRange(2, 1, rowsOut.length, 11).setValues(rowsOut);
   SpreadsheetApp.flush();
 
@@ -563,14 +566,16 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
           .setValues([['skip', '', 'E열(문제) 비어있음']]);
       } else {
         const formatGuide = getFormatGuide(answerType);
+        const imgsP1 = iv_imageParts_([stem]);                       // 패치 13: 그림 첨부
+        sheet.getRange(t.row, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(imgsP1));
         // ★ 함수형 치환: 치환값의 $$/$& 특수 패턴이 LaTeX를 손상시키지 않도록
         const userContent = pPrompts.user
           .replace('{problem}', function () { return stem; })
-          .replace('{format}',  function () { return formatGuide; });
+          .replace('{format}',  function () { return formatGuide; }) + iv_imageNote_(imgsP1);
 
         const split = (t.retryProblem && t.retrySolution) ? 2 : 1;
         const budget = Math.max((deadline - Date.now()) / split, VCONFIG.API_CALL_RESERVE_MS);
-        const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, budget);
+        const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, budget, imgsP1);
 
         sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3).setValues([[
           String(pResult.verdict || 'error').toLowerCase(),
@@ -591,12 +596,14 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
         sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2)
           .setValues([['SKIP', 'C열(풀이) 비어있음']]);
       } else {
+        const imgsP2 = iv_imageParts_([stem, solution]);             // 패치 13: 그림 첨부
+        sheet.getRange(t.row, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(imgsP2));
         const userContent2 = sPrompts.user
           .replace(/\{problem\}/g,  function () { return stem; })
-          .replace(/\{solution\}/g, function () { return solution; });
+          .replace(/\{solution\}/g, function () { return solution; }) + iv_imageNote_(imgsP2);
 
         const budget = Math.max(deadline - Date.now(), VCONFIG.API_CALL_RESERVE_MS);
-        const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, budget);
+        const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, budget, imgsP2);
 
         sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
           String(sResult.verdict || 'error').toLowerCase(),

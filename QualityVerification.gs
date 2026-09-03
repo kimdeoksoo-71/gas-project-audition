@@ -274,7 +274,7 @@ function verifyQualityForRow_(sheet, row, qPrompts, budgetMs) {
   try {
     // ── (패치 12 확장) 본문 그림 수집: Itemverification 패치 12 가 있어야 동작 ──
     const qImgs = (typeof iv_imageParts_ === 'function') ? iv_imageParts_([stem, solution]) : [];
-    const qNote = (typeof iv_imageNote_ === 'function') ? iv_imageNote_(qImgs.length) : '';
+    const qNote = (typeof iv_imageNote_ === 'function') ? iv_imageNote_(qImgs) : '';   // 패치 13: 누락 목록 포함
 
     // ── [1차] Gemini 후보 생성 ──
     // ★ 함수형 치환 필수: 문자열 치환값의 $$/$& 특수 패턴이 LaTeX를 손상시킴

@@ -6,9 +6,9 @@
  * Stat 시트 3행 이하에 기록합니다.
  *
  * [확정 사양 — 2026-07-30 승인]
- *  ① 세트 경계: Y열(세트명) 값이 "행 번호상 연속으로 동일"한 구간.
+ *  ① 세트 경계: AD열(세트명, v4 이전: Y열) 값이 "행 번호상 연속으로 동일"한 구간.
  *     구간 내 S열이 빈/무효인 행이 있어도 세트가 끊기지 않음.
- *     Y열이 빈 행은 어떤 세트에도 속하지 않으며 구간을 끊음.
+ *     AD열이 빈 행은 어떤 세트에도 속하지 않으며 구간을 끊음.
  *  ② 실행 시마다 Stat 3행 이하를 전부 지우고 Stack 전체를 재집계.
  *     (2행의 함수는 절대 건드리지 않음)
  *  ③ D열 모델명: 세트 내 첫 번째 비어있지 않은 T값.
@@ -34,12 +34,15 @@ const STATCONFIG = {
   SRC_SHEET: 'Stack',
   DST_SHEET: 'Stat',
 
-  /* Stack 시트 열 번호 (1-based) */
+  /* Stack 시트 열 번호 (1-based)
+   * v4(2026-09-03, 체크리스트 ④): 세트명·문항그룹이 Y/Z → AD/AE로 이전됨.
+   * Y~AC(25~29)는 행 데이터용 여유 열 (Y=fig_info).
+   * ⚠️ 기존 Stack 데이터는 [📦 Stack 세트열 이전(1회)] 메뉴로 먼저 이전할 것. */
   SRC_COL: {
     TOKENS: 19,   // S  thinking_tokens
     MODEL:  20,   // T  AI 모델명
-    SET:    25,   // Y  세트명
-    GROUP:  26,   // Z  문항그룹 (예: 1공통03)
+    SET:    30,   // AD 세트명   (v4: Y→AD)
+    GROUP:  31,   // AE 문항그룹 (v4: Z→AE, 예: 1공통03)
   },
 
   /* 하나의 세트로 인정하는 최소 유효 문항 수 (S값 > 0 기준) */
@@ -125,7 +128,7 @@ function stat_core_() {
   // Stack에 Y/Z열이 존재하는지 방어적 확인
   if (src.getMaxColumns() < STATCONFIG.SRC_COL.GROUP) {
     return fail(
-      `Stack 시트에 Z열(문항그룹)까지 존재해야 합니다.\n` +
+      `Stack 시트에 AE열(문항그룹)까지 존재해야 합니다.\n` +
       `현재 최대 열: ${src.getMaxColumns()} / 필요: ${STATCONFIG.SRC_COL.GROUP}`
     );
   }
@@ -204,13 +207,13 @@ function statBuildTotalKeySet_() {
 }
 
 /**
- * Y열 기준 연속 동일 세트명 구간 탐지
+ * AD열(세트명) 기준 연속 동일 세트명 구간 탐지
  * @param {Array<Array>} data  Stack 2행 이하 A~Z 값 배열
  * @return {Array<{setName:string, startIdx:number, endIdx:number}>}
  *         startIdx/endIdx는 data 배열 인덱스 (실제 행번호 = idx + 2)
  */
 function statFindSetRuns_(data) {
-  const SET_IDX = STATCONFIG.SRC_COL.SET - 1;   // Y = index 24
+  const SET_IDX = STATCONFIG.SRC_COL.SET - 1;   // AD = index 29
   const runs = [];
   let cur = null;
 
@@ -218,7 +221,7 @@ function statFindSetRuns_(data) {
     const setName = String(data[i][SET_IDX] || '').trim();
 
     if (setName === '') {
-      // Y열이 빈 행: 어떤 세트에도 속하지 않으며 구간을 끊음
+      // AD열이 빈 행: 어떤 세트에도 속하지 않으며 구간을 끊음
       if (cur) { runs.push(cur); cur = null; }
       continue;
     }
@@ -243,7 +246,7 @@ function statBuildStatRow_(run, data) {
   const C = STATCONFIG.SRC_COL;
   const TOK_IDX   = C.TOKENS - 1;   // S = index 18
   const MODEL_IDX = C.MODEL  - 1;   // T = index 19
-  const GROUP_IDX = C.GROUP  - 1;   // Z = index 25
+  const GROUP_IDX = C.GROUP  - 1;   // AE = index 30
 
   // ── 구간 내 유효 행 수집 ──
   const validRows = [];   // { tokens:number, group:string }
