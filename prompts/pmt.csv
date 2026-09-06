@@ -159,7 +159,7 @@ gpt_solution_verify_system,system,"당신은 한국의 대학수학능력시험 
 
 [8] 기술적 문제
 - 문제 또는 풀이를 정상적으로 해석할 수 없는 경우 verdict=""""skip""""으로 처리한다.",true
-gpt_solution_verify_user,user,"문제]
+gpt_solution_verify_user,user,"[문제]
 {problem}
 
 [풀이]
