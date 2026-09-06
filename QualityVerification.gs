@@ -1,7 +1,19 @@
 /**
  * ============================================================
- * QualityVerification.gs — STEP 3: 해설 논리 검증 (v2)
+ * QualityVerification.gs — STEP 3: 해설 논리 검증 (v4)
  * ============================================================
+ * v4 변경사항 (2026-09-06, 프롬프트 V2 대응 — 결함 유형 6종 확장):
+ *   - 결함 유형 2종 → 6종: logic_gap(비약) / invalid_inference(오추론) /
+ *     unwarranted_assumption(가정) / case_omission(경우누락) /
+ *     sufficiency_unchecked(충분성) / inconsistency(불일치)
+ *   - Q_TYPES 상수 신설: sanitizeCandidates_ 의 type 정규화와
+ *     synthesizeQuality_ 의 V열 라벨이 이 한 곳을 참조 (유형 추가 시 여기만 수정)
+ *   - 미지 type 은 부분 문자열로 정규화, 그래도 실패하면 logic_gap 으로 폴백
+ *   - MAX_CANDIDATES 8 → 12 (1차 Gemini 가 recall 지향으로 바뀌어 후보 증가)
+ *   - 합성 규칙(valid≥1→fail, uncertain≥1→check, 전부 invalid→ok)은 변경 없음
+ *   - pmt 시트 gemini_quality_verify / claude_quality_judge V2 프롬프트와 함께 적용할 것
+ *     (구 프롬프트와도 호환: 2종만 오면 그대로 동작)
+ *
  * v2 변경사항:
  *   - 사이드바 실행기(QualityRunner.html) 추가: 행 1건 = 서버 호출 1건 구조로
  *     GAS 6분 실행 한도를 원천 회피 → 시간 초과 재시작 불필요.
@@ -12,7 +24,7 @@
  *   - 기존 동기 실행(startQualityVerification)은 보조용으로 유지(에디터에서 호출 가능)
  *
  * 목적:
- *   해설의 '논리적 비약(logic_gap)'과 '일관성 없는 서술(inconsistency)'을
+ *   해설의 논리 결함(비약·오추론·근거 없는 가정·경우 누락·충분성 미확인·불일치)을
  *   비대칭 교차 검증으로 판정한다.
  *     [1차] Gemini(후보 생성, recall) → [2차] Claude(후보 판정, precision)
  *     → [합성] 코드 로직으로 U/V/W/X 기록
@@ -74,8 +86,9 @@ const QCONFIG = {
   RETRY_DELAY_MS: 3000,
   INTER_ROW_COOLDOWN_MS: 1500,
 
-  /* 후보 상한 (Claude 프롬프트 비대 방지) */
-  MAX_CANDIDATES: 8,
+  /* 후보 상한 (Claude 프롬프트 비대 방지)
+     v4: 8 → 12. 1차 프롬프트가 심각도순 정렬을 지시하므로 절단 시 앞쪽(중요) 후보가 남는다. */
+  MAX_CANDIDATES: 12,
 
   /* Data_DS 열 번호 */
   COL: {
@@ -357,7 +370,37 @@ function repairLatexControlChars_(s) {
     .replace(/\t(?=[a-zA-Z])/g, '\\t');  // \theta, \tan, \text ...
 }
 
-/** Gemini 후보 배열 정제: 필드 문자열화, LaTeX 복구, type 정규화, 빈 quote 제거, id 재부여 */
+/**
+ * v4: 결함 유형 정의 (단일 출처)
+ *  - label : V열 리포트 블록 제목 "[라벨n]" 에 쓰는 한글 라벨
+ *  - hints : 1차 모델이 type 을 변형해 보냈을 때 정규화용 부분 문자열 (소문자, 앞의 것이 우선)
+ *  순서는 폴백 판정 순서이기도 하다. 'logic_gap' 은 마지막 폴백이므로 hints 검사 대상에서 제외.
+ */
+const Q_TYPES = {
+  invalid_inference:      { label: '오추론',   hints: ['infer', 'invalid'] },
+  unwarranted_assumption: { label: '가정',     hints: ['assum', 'unwarrant'] },
+  case_omission:          { label: '경우누락', hints: ['case', 'omiss'] },
+  sufficiency_unchecked:  { label: '충분성',   hints: ['suffic', 'uncheck'] },
+  inconsistency:          { label: '불일치',   hints: ['incons'] },
+  logic_gap:              { label: '비약',     hints: ['gap', 'logic'] },
+};
+const Q_TYPE_FALLBACK = 'logic_gap';
+
+/** 1차 응답의 type 문자열을 Q_TYPES 키로 정규화. 정확 일치 → 부분 문자열 → 폴백 */
+function normalizeCandidateType_(raw) {
+  const t = String(raw || '').trim().toLowerCase().replace(/[\s\-]+/g, '_');
+  if (Object.prototype.hasOwnProperty.call(Q_TYPES, t)) return t;
+  const keys = Object.keys(Q_TYPES);
+  for (let k = 0; k < keys.length; k++) {
+    const hints = Q_TYPES[keys[k]].hints;
+    for (let h = 0; h < hints.length; h++) {
+      if (t.indexOf(hints[h]) !== -1) return keys[k];
+    }
+  }
+  return Q_TYPE_FALLBACK;
+}
+
+/** Gemini 후보 배열 정제: 필드 문자열화, LaTeX 복구, type 정규화(v4: 6종), 빈 quote 제거, id 재부여 */
 function sanitizeCandidates_(arr) {
   const out = [];
   for (let i = 0; i < arr.length; i++) {
@@ -365,10 +408,7 @@ function sanitizeCandidates_(arr) {
     // ★ 복구를 trim보다 먼저: 선두의 \f 등 제어문자가 trim에 공백으로 소실되기 전에 복원
     const quote  = repairLatexControlChars_(String(c.quote  || '')).trim();
     const reason = repairLatexControlChars_(String(c.reason || '')).trim();
-    let type = String(c.type || '').trim().toLowerCase();
-    if (type !== 'logic_gap' && type !== 'inconsistency') {
-      type = (type.indexOf('incons') !== -1) ? 'inconsistency' : 'logic_gap';
-    }
+    const type   = normalizeCandidateType_(c.type);
     if (quote === '' && reason === '') continue;
     out.push({ id: 'c' + (out.length + 1), type: type, quote: quote, reason: reason });
   }
@@ -402,8 +442,12 @@ function synthesizeQuality_(candidates, judgments, truncNote) {
     if (j && j.id) byId[String(j.id).trim()] = j;
   });
 
-  const TYPE_LABEL = { logic_gap: '비약', inconsistency: '불일치' };
-  const counter = { logic_gap: 0, inconsistency: 0 };
+  // v4: 라벨·카운터를 Q_TYPES 에서 생성 (유형 추가 시 Q_TYPES 만 수정)
+  const counter = {};
+  Object.keys(Q_TYPES).forEach(function (k) { counter[k] = 0; });
+  const labelOf = function (type) {
+    return (Q_TYPES[type] && Q_TYPES[type].label) || Q_TYPES[Q_TYPE_FALLBACK].label;
+  };
   const reportBlocks = [];
   const auditLines = [];
   let validCnt = 0, uncertainCnt = 0;
@@ -419,9 +463,10 @@ function synthesizeQuality_(candidates, judgments, truncNote) {
 
     if (ruling === 'valid') {
       validCnt++;
+      if (!Object.prototype.hasOwnProperty.call(counter, c.type)) counter[c.type] = 0;
       counter[c.type]++;
       reportBlocks.push(
-        '[' + TYPE_LABEL[c.type] + counter[c.type] + ']\n' +
+        '[' + labelOf(c.type) + counter[c.type] + ']\n' +
         '지점: ' + c.quote + '\n' +
         '근거: ' + (note || c.reason)
       );
