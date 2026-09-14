@@ -33,6 +33,11 @@
 
 /* ─── 모델 프리셋 ─── */
 const MODEL_PRESETS = {
+  'gemini-3.8-flash': {
+    label:     '3.8 Flash (GA 2026-09-02, 최신 Flash)',
+    gen:       '3.x',
+    thinkingLevel: 'HIGH',    // 수학 검증에는 HIGH 필수. ⚠ 3.8은 thinking_level 'minimal' 미지원(low/medium/high만) — HIGH 고정이라 무관
+  },
   'gemini-3.5-flash': {
     label:     '3.5 Flash (GA, 고속+고성능)',
     gen:       '3.x',
@@ -1226,11 +1231,12 @@ function markRowAsTimeout_(row, minutesSince) {
    ═══════════════════════════════════════════════ */
 
 /**
- * 메뉴 호출: 지정 범위 내 N열, Q열 또는 U열(STEP3)이 'error'/'timeout'인 행만 재검증
+ * 메뉴 호출: 지정 범위 내 N열, Q열, U열(STEP3) 또는 Z열(STEP4)이 'error'/'timeout'인 행만 재검증
  *
  * - N열만 error/timeout이면 STEP 1만 재실행
  * - Q열만 error/timeout이면 STEP 2만 재실행
  * - U열이 error/timeout이면 STEP 3(논리 검증) 재실행 — verifyQualityForRow_ 재사용
+ * - (v5) Z열이 error/timeout이면 STEP 4(군더더기 검출)만 재실행 — verifyGarbageForRow_ 재사용. U/V/W/X 는 건드리지 않는다
  * - 복수 해당 시 해당 STEP 모두 재실행
  * - 동기 실행: 시간 초과 시 사용자에게 안내 후 다시 메뉴 실행 권장
  */
@@ -1244,7 +1250,7 @@ function retryErrorRows() {
   const input = ui.prompt(
     'Error/Timeout 행 재검증',
     '재검증할 행 범위를 입력하세요 (예: 2-100)\n' +
-    'N열, Q열 또는 U열(STEP3)이 error 또는 timeout인 행만 재검증됩니다.',
+    'N열, Q열, U열(STEP3) 또는 Z열(STEP4 군더더기)이 error 또는 timeout인 행만 재검증됩니다.',
     ui.ButtonSet.OK_CANCEL
   );
   if (input.getSelectedButton() !== ui.Button.OK) return;
@@ -1260,9 +1266,11 @@ function retryErrorRows() {
   if (!sheet) { ui.alert('Data_DS 시트 없음'); return; }
   iv_ensureFigInfoHeader_(sheet);   // 패치 13
 
-  // 범위 데이터 일괄 읽기 (STEP3 통합: 18열 → 21열(U)까지 확장)
+  // 범위 데이터 일괄 읽기 (STEP3 통합: 18열 → 21열(U) → v5 STEP4: 28열(AB)까지 확장)
+  if (typeof g_ensureHeaders_ === 'function') g_ensureHeaders_(sheet);   // 열 폭 ≥ AB 보장 (없으면 getRange 가 예외)
   const numRows = range.endRow - range.startRow + 1;
-  const data = sheet.getRange(range.startRow, 1, numRows, 21).getValues();
+  const readCols = Math.max(21, QCONFIG.G.COL.G_AUDIT);
+  const data = sheet.getRange(range.startRow, 1, numRows, readCols).getValues();
 
   // error/timeout 행 추출
   const targets = [];
@@ -1270,17 +1278,20 @@ function retryErrorRows() {
     const nVal = String(data[i][VCONFIG.COL.P_VERDICT - 1] || '').toLowerCase().trim();
     const qVal = String(data[i][VCONFIG.COL.S_VERDICT - 1] || '').toLowerCase().trim();
     const uVal = String(data[i][QCONFIG.COL.Q_VERDICT - 1] || '').toLowerCase().trim();  // U(21): STEP3
+    const zVal = String(data[i][QCONFIG.G.COL.G_VERDICT - 1] || '').toLowerCase().trim(); // Z(26): STEP4 (v5)
 
     const nIsErr = (nVal === 'error' || nVal === 'timeout');
     const qIsErr = (qVal === 'error' || qVal === 'timeout');
     const uIsErr = (uVal === 'error' || uVal === 'timeout');
+    const zIsErr = (zVal === 'error' || zVal === 'timeout');
 
-    if (nIsErr || qIsErr || uIsErr) {
+    if (nIsErr || qIsErr || uIsErr || zIsErr) {
       targets.push({
         row: range.startRow + i,
         retryProblem: nIsErr,
         retrySolution: qIsErr,
         retryQuality: uIsErr,
+        retryGarbage: zIsErr,
       });
     }
   }
@@ -1313,19 +1324,28 @@ function retryErrorRows() {
     return;
   }
 
-  // STEP3(U열) 대상이 있으면 STEP3 프롬프트·Claude 키도 사전 점검
+  // STEP3(U열)·STEP4(Z열) 대상이 있으면 해당 프롬프트·Claude 키도 사전 점검
   const needQuality = targets.some(t => t.retryQuality);
+  const needGarbage = targets.some(t => t.retryGarbage);
   let qPrompts = null;
+  let gPrompts = null;
   if (needQuality) {
     qPrompts = loadQualityPrompts_();   // QualityVerification.gs
     if (!qPrompts) {
       ui.alert('STEP3 프롬프트 로드 실패. pmt 시트의 quality 세트(key/role/enabled)를 확인하세요.');
       return;
     }
-    if (!PropertiesService.getScriptProperties().getProperty('CLAUDE_API_KEY')) {
-      ui.alert('CLAUDE_API_KEY가 설정되지 않았습니다. (STEP3 재검증에 필요)');
+  }
+  if (needGarbage) {
+    gPrompts = loadGarbagePrompts_();   // QualityVerification.gs v5
+    if (!gPrompts) {
+      ui.alert('STEP4 프롬프트 로드 실패. pmt 시트의 garbage 세트(gemini_garbage_verify / claude_garbage_judge)를 확인하세요.');
       return;
     }
+  }
+  if ((needQuality || needGarbage) && !PropertiesService.getScriptProperties().getProperty('CLAUDE_API_KEY')) {
+    ui.alert('CLAUDE_API_KEY가 설정되지 않았습니다. (STEP3·4 재검증에 필요)');
+    return;
   }
 
   const startTime = Date.now();
@@ -1337,7 +1357,7 @@ function retryErrorRows() {
     const t = targets[k];
 
     // ── 시간 예산 체크 (STEP3 포함 행은 Claude 호출 지연을 감안해 더 큰 예약) ──
-    const rowReserve = t.retryQuality
+    const rowReserve = (t.retryQuality || t.retryGarbage)
       ? Math.max(VCONFIG.ROW_TIME_RESERVE_MS, QCONFIG.ROW_TIME_RESERVE_MS)
       : VCONFIG.ROW_TIME_RESERVE_MS;
     const remaining = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
@@ -1421,9 +1441,20 @@ function retryErrorRows() {
         if (t.retryProblem || t.retrySolution) {
           Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
         }
-        const qBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
+        // STEP4 도 같은 행에서 돌면 남은 예산을 나눈다
+        const qBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / (t.retryGarbage ? 2 : 1);
         // verifyQualityForRow_는 실패 시 내부에서 U='error' 기록 후 'error' 반환 (throw 없음)
         verifyQualityForRow_(sheet, t.row, qPrompts, qBudget);
+      }
+
+      // ── v5(STEP4): 군더더기 재검증 (Z열 error/timeout — verifyGarbageForRow_ 재사용, U/V/W/X 무접촉) ──
+      if (t.retryGarbage) {
+        if (t.retryProblem || t.retrySolution || t.retryQuality) {
+          Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
+        }
+        const gBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
+        // verifyGarbageForRow_는 실패 시 내부에서 Z='error' 기록 후 'error' 반환 (throw 없음)
+        verifyGarbageForRow_(sheet, t.row, gPrompts, gBudget);
       }
 
       processed++;

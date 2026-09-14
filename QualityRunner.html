@@ -19,10 +19,12 @@
         padding: 12px; margin-bottom: 10px;
       }
       label { font-size: 11px; color: #5f6368; display: block; margin-bottom: 4px; }
-      input[type=text] {
+      input[type=text], select {
         width: 100%; box-sizing: border-box; padding: 8px;
         border: 1px solid #dadce0; border-radius: 6px; font-size: 14px;
+        background: #fff;
       }
+      .field + .field { margin-top: 8px; }
       .btn-row { display: flex; gap: 8px; margin-top: 10px; }
       button {
         flex: 1; padding: 9px 0; border: none; border-radius: 6px;
@@ -44,7 +46,8 @@
       #progText { font-size: 12px; font-weight: 600; }
       #curRow, #timing { font-size: 11px; color: #5f6368; margin-top: 2px; }
       /* 카운터 */
-      .counts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+      .counts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; align-items: center; }
+      .counts .lbl { font-size: 11px; color: #5f6368; width: 100%; margin-top: 4px; }
       .chip {
         font-size: 11px; padding: 2px 8px; border-radius: 10px;
         background: #e8eaed; color: #3c4043;
@@ -53,14 +56,16 @@
       .chip.c-fail  { background: #fce8e6; color: #c5221f; }
       .chip.c-check { background: #fef7e0; color: #b06000; }
       .chip.c-error { background: #f3e8fd; color: #7627bb; }
+      .chip.c-garbage { background: #fff4e5; color: #8a5a00; }   /* 군더더기는 결함색(빨강)을 쓰지 않는다 */
       /* 로그 */
       #log {
         background: #fff; border: 1px solid #dadce0; border-radius: 8px;
-        padding: 8px; height: 220px; overflow-y: auto;
+        padding: 8px; height: 200px; overflow-y: auto;
         font-family: ui-monospace, Menlo, monospace; font-size: 11px;
         white-space: pre-wrap; word-break: break-all;
       }
       .log-fail { color: #c5221f; font-weight: 600; }
+      .log-garb { color: #8a5a00; font-weight: 600; }
       .log-err  { color: #7627bb; }
       .log-sys  { color: #1a73e8; }
       #summary {
@@ -71,16 +76,27 @@
     </style>
   </head>
   <body>
-    <h3>🧠 논리 검증 실행기</h3>
+    <h3>🧠 논리·군더더기 검증 실행기</h3>
     <div class="desc">
-      행 1건 = 서버 호출 1건 구조로 6분 한도 없이 끝까지 자동 실행됩니다.<br>
-      실행 중에는 이 사이드바(탭)를 열어 두세요. U열이 이미 채워진 행
-      (error/timeout 제외)은 자동으로 건너뜁니다.
+      (행, 검증) 1건 = 서버 호출 1건 구조로 6분 한도 없이 끝까지 자동 실행됩니다.<br>
+      실행 중에는 이 사이드바(탭)를 열어 두세요. 논리 검증은 U열, 군더더기 검출은 Z열이
+      이미 채워진 행(error/timeout 제외)을 <b>각각</b> 건너뜁니다 — STEP3가 끝난 행에
+      군더더기만 소급할 수 있습니다.
     </div>
 
     <div class="card">
-      <label for="rangeInput">행 범위</label>
-      <input type="text" id="rangeInput" placeholder="예: 2-101" />
+      <div class="field">
+        <label for="rangeInput">행 범위</label>
+        <input type="text" id="rangeInput" placeholder="예: 2-101" />
+      </div>
+      <div class="field">
+        <label for="modeSel">검증</label>
+        <select id="modeSel">
+          <option value="both" selected>둘 다 — 논리 검증(STEP 3) → 군더더기 검출(STEP 4)</option>
+          <option value="quality">논리 검증만 (STEP 3 · U~X열)</option>
+          <option value="garbage">군더더기 검출만 (STEP 4 · Z~AB열)</option>
+        </select>
+      </div>
       <div class="btn-row">
         <button id="btnStart" onclick="startRun()">▶ 시작</button>
         <button id="btnStop" onclick="requestStop()" disabled>⛔ 중단</button>
@@ -92,12 +108,23 @@
       <div class="bar-bg"><div id="barFill"></div></div>
       <div id="curRow">대기 중</div>
       <div id="timing"></div>
+      <div class="counts" id="countsQ">
+        <span class="lbl">논리 검증 (STEP 3)</span>
+        <span class="chip c-ok">ok <b id="qOk">0</b></span>
+        <span class="chip c-fail">fail <b id="qFail">0</b></span>
+        <span class="chip c-check">check <b id="qCheck">0</b></span>
+        <span class="chip">skip <b id="qSkip">0</b></span>
+        <span class="chip c-error">error <b id="qError">0</b></span>
+      </div>
+      <div class="counts" id="countsG">
+        <span class="lbl">군더더기 검출 (STEP 4)</span>
+        <span class="chip c-ok">clean <b id="gClean">0</b></span>
+        <span class="chip c-garbage">garbage <b id="gGarbage">0</b></span>
+        <span class="chip c-check">check <b id="gCheck">0</b></span>
+        <span class="chip">skip <b id="gSkip">0</b></span>
+        <span class="chip c-error">error <b id="gError">0</b></span>
+      </div>
       <div class="counts">
-        <span class="chip c-ok">ok <b id="cOk">0</b></span>
-        <span class="chip c-fail">fail <b id="cFail">0</b></span>
-        <span class="chip c-check">check <b id="cCheck">0</b></span>
-        <span class="chip">skip <b id="cSkip">0</b></span>
-        <span class="chip c-error">error <b id="cError">0</b></span>
         <span class="chip">통신실패 <b id="cComm">0</b></span>
       </div>
     </div>
@@ -106,17 +133,28 @@
     <div id="summary"></div>
 
     <script>
-      var queue = [];
+      /* 작업 항목 = (row, step). qr_start 가 행마다 필요한 step 만 돌려주고, 여기서 순서대로 펼친다.
+         ⚠ 한 행의 두 검증을 한 서버 호출에 합치지 않는다 — 각 호출이 독립 예산(270초)을 받아야 한다. */
+      var work = [];
       var idx = 0;
+      var mode = 'both';
       var running = false;
       var stopRequested = false;
       var consecCommFail = 0;
       var startedAt = 0;
-      var counts = { ok: 0, fail: 0, check: 0, skip: 0, error: 0, stopped: 0 };
+      var counts = null;
       var commFails = 0;
       var MAX_CONSEC_COMM_FAIL = 3;
+      var STEP_LABEL = { quality: '논리', garbage: '군더더기' };
 
       function $(id) { return document.getElementById(id); }
+
+      function freshCounts() {
+        return {
+          quality: { ok: 0, fail: 0, check: 0, skip: 0, error: 0 },
+          garbage: { clean: 0, garbage: 0, check: 0, skip: 0, error: 0 }
+        };
+      }
 
       function addLog(msg, cls) {
         var log = $('log');
@@ -135,43 +173,54 @@
         $('btnStart').disabled = on;
         $('btnStop').disabled = !on;
         $('rangeInput').disabled = on;
+        $('modeSel').disabled = on;
       }
 
       function updateProgress() {
-        var done = idx;
-        var total = queue.length;
-        $('progText').textContent = done + ' / ' + total;
-        $('barFill').style.width = (total ? Math.round(done * 100 / total) : 0) + '%';
-        $('cOk').textContent = counts.ok;
-        $('cFail').textContent = counts.fail;
-        $('cCheck').textContent = counts.check;
-        $('cSkip').textContent = counts.skip;
-        $('cError').textContent = counts.error;
+        var total = work.length;
+        $('progText').textContent = idx + ' / ' + total + ' 작업';
+        $('barFill').style.width = (total ? Math.round(idx / total * 100) : 0) + '%';
+        var q = counts.quality, g = counts.garbage;
+        $('qOk').textContent = q.ok;       $('qFail').textContent = q.fail;
+        $('qCheck').textContent = q.check; $('qSkip').textContent = q.skip; $('qError').textContent = q.error;
+        $('gClean').textContent = g.clean; $('gGarbage').textContent = g.garbage;
+        $('gCheck').textContent = g.check; $('gSkip').textContent = g.skip; $('gError').textContent = g.error;
         $('cComm').textContent = commFails;
-
-        if (done > 0) {
-          var elapsedS = Math.round((Date.now() - startedAt) / 1000);
-          var avg = elapsedS / done;
-          var etaMin = Math.ceil(avg * (total - done) / 60);
-          $('timing').textContent =
-            '경과 ' + Math.floor(elapsedS / 60) + '분 ' + (elapsedS % 60) + '초 · ' +
-            '평균 ' + Math.round(avg) + '초/행 · 남은 예상 ' + etaMin + '분';
+        if (startedAt && idx > 0) {
+          var elapsed = (Date.now() - startedAt) / 1000;
+          var per = elapsed / idx;
+          var eta = Math.max(0, Math.round(per * (total - idx)));
+          $('timing').textContent = '경과 ' + fmt(elapsed) + ' · 작업당 ' + Math.round(per) + 's · 남은 예상 ' + fmt(eta);
+        } else {
+          $('timing').textContent = '';
         }
+      }
+
+      function fmt(sec) {
+        sec = Math.round(sec);
+        var m = Math.floor(sec / 60), s = sec % 60;
+        return (m ? m + '분 ' : '') + s + '초';
       }
 
       function startRun() {
         var rangeText = ($('rangeInput').value || '').trim();
         if (!rangeText) { alert('행 범위를 입력하세요. (예: 2-101)'); return; }
+        mode = $('modeSel').value || 'both';
 
         setUiRunning(true);
         $('progressWrap').style.display = 'block';
+        $('countsQ').style.display = (mode === 'garbage') ? 'none' : 'flex';
+        $('countsG').style.display = (mode === 'quality') ? 'none' : 'flex';
         $('summary').style.display = 'none';
         idx = 0;
-        counts = { ok: 0, fail: 0, check: 0, skip: 0, error: 0, stopped: 0 };
+        work = [];
+        counts = freshCounts();
         commFails = 0;
         consecCommFail = 0;
         stopRequested = false;
-        addLog('시작 준비 중... (범위 ' + rangeText + ')', 'log-sys');
+        startedAt = 0;
+        updateProgress();
+        addLog('시작 준비 중... (범위 ' + rangeText + ' · 모드 ' + $('modeSel').options[$('modeSel').selectedIndex].text + ')', 'log-sys');
 
         google.script.run
           .withSuccessHandler(onStarted)
@@ -179,7 +228,7 @@
             addLog('시작 실패: ' + (err && err.message ? err.message : err), 'log-fail');
             setUiRunning(false);
           })
-          .qr_start(rangeText);
+          .qr_start(rangeText, mode);
       }
 
       function onStarted(res) {
@@ -188,14 +237,23 @@
           setUiRunning(false);
           return;
         }
-        queue = res.targets || [];
+        // 행마다 필요한 검증만 (row, step) 작업 항목으로 펼친다 — 순서 = 서버가 준 steps 순서(quality → garbage)
+        var targets = res.targets || [];
+        var rowsQ = 0, rowsG = 0;
+        for (var i = 0; i < targets.length; i++) {
+          var t = targets[i];
+          for (var s = 0; s < t.steps.length; s++) {
+            work.push({ row: t.row, step: t.steps[s] });
+            if (t.steps[s] === 'quality') rowsQ++; else rowsG++;
+          }
+        }
         startedAt = Date.now();
         addLog('1차 ' + res.geminiModel + ' → 2차 ' + res.claudeModel, 'log-sys');
-        addLog('대상 ' + queue.length + '행 (이미 완료 ' + res.skippedDone + '행 건너뜀)', 'log-sys');
+        addLog('대상 ' + targets.length + '행 · 작업 ' + work.length + '건 (논리 ' + rowsQ + ' · 군더더기 ' + rowsG + ') · 이미 완료 ' + res.skippedDone + '행 건너뜀', 'log-sys');
         updateProgress();
 
-        if (queue.length === 0) {
-          finishRun('처리할 행이 없습니다.');
+        if (work.length === 0) {
+          finishRun('처리할 작업이 없습니다.');
           return;
         }
         processNext();
@@ -203,14 +261,14 @@
 
       function processNext() {
         if (stopRequested) { finishRun('사용자 중단'); return; }
-        if (idx >= queue.length) { finishRun('완료'); return; }
+        if (idx >= work.length) { finishRun('완료'); return; }
 
-        var row = queue[idx];
-        $('curRow').textContent = '처리 중: 행 ' + row + ' (최대 수 분 소요)';
+        var item = work[idx];
+        $('curRow').textContent = '처리 중: 행 ' + item.row + ' · ' + STEP_LABEL[item.step] + ' (최대 수 분 소요)';
         google.script.run
           .withSuccessHandler(onRowDone)
           .withFailureHandler(onRowFail)
-          .qr_processRow(row, idx === 0);
+          .qr_processRow(item.row, item.step, idx === 0);
       }
 
       function onRowDone(res) {
@@ -219,20 +277,25 @@
           finishRun('중단 감지 (STOP 버튼 / 메뉴 중단)');
           return;
         }
+        var step = (res && res.step) || (work[idx] && work[idx].step) || 'quality';
         var status = (res && res.status) || 'error';
-        if (counts[status] !== undefined) counts[status]++;
-        var cls = status === 'fail' ? 'log-fail' : (status === 'error' ? 'log-err' : '');
-        addLog('행 ' + (res && res.row) + ' → ' + status + (res && res.message ? ' (' + res.message + ')' : ''), cls);
+        var bucket = counts[step] || counts.quality;
+        if (bucket[status] !== undefined) bucket[status]++;
+        var cls = (status === 'fail') ? 'log-fail'
+                : (status === 'garbage') ? 'log-garb'
+                : (status === 'error') ? 'log-err' : '';
+        addLog('행 ' + (res && res.row) + ' · ' + STEP_LABEL[step] + ' → ' + status + (res && res.message ? ' (' + res.message + ')' : ''), cls);
         idx++;
         updateProgress();
         processNext();
       }
 
       function onRowFail(err) {
-        // 서버 강제 종료·통신 오류 등: U열 미기록 가능 → 재실행 시 자동 포착됨
+        // 서버 강제 종료·통신 오류 등: 그 검증의 verdict 열 미기록 가능 → 같은 범위 재실행 시 자동 포착됨
         commFails++;
         consecCommFail++;
-        addLog('행 ' + queue[idx] + ' 통신/실행 실패: ' + (err && err.message ? err.message : err), 'log-err');
+        var item = work[idx] || {};
+        addLog('행 ' + item.row + ' · ' + (STEP_LABEL[item.step] || '') + ' 통신/실행 실패: ' + (err && err.message ? err.message : err), 'log-err');
         if (consecCommFail >= MAX_CONSEC_COMM_FAIL) {
           finishRun('연속 통신 실패 ' + MAX_CONSEC_COMM_FAIL + '회 — 자동 중단 (네트워크/서비스 상태 확인 후 재시작)');
           return;
@@ -245,8 +308,8 @@
       function requestStop() {
         stopRequested = true;
         $('btnStop').disabled = true;
-        $('curRow').textContent = '중단 요청됨 — 현재 행 완료 후 정지합니다.';
-        addLog('중단 요청 (현재 행 완료 후 정지)', 'log-sys');
+        $('curRow').textContent = '중단 요청됨 — 현재 작업 완료 후 정지합니다.';
+        addLog('중단 요청 (현재 작업 완료 후 정지)', 'log-sys');
         google.script.run.qr_requestStop();
       }
 
@@ -254,15 +317,21 @@
         google.script.run.qr_finish();
         setUiRunning(false);
         $('curRow').textContent = reason;
+        var q = counts.quality, g = counts.garbage;
+        var lines = ['[' + reason + ']', '처리 ' + idx + ' / ' + work.length + ' 작업'];
+        if (mode !== 'garbage') {
+          lines.push('논리(STEP 3): ok ' + q.ok + ' · fail ' + q.fail + ' · check ' + q.check + ' · skip ' + q.skip + ' · error ' + q.error);
+        }
+        if (mode !== 'quality') {
+          lines.push('군더더기(STEP 4): clean ' + g.clean + ' · garbage ' + g.garbage + ' · check ' + g.check + ' · skip ' + g.skip + ' · error ' + g.error);
+        }
+        lines.push('통신실패 ' + commFails);
+        if (q.fail > 0) lines.push('\nfail 행의 V열(리포트)·W열(감사)을 검토하세요.');
+        if (g.garbage > 0 || g.check > 0) lines.push((q.fail > 0 ? '' : '\n') + 'garbage/check 행의 AA열(리포트)·AB열(감사)을 검토하세요. [결함의심]은 U/V열과 대조하세요.');
+        if (q.error > 0 || g.error > 0 || commFails > 0) lines.push('error/미기록 작업은 같은 범위 재실행 또는 "Error 행 재검증"으로 처리됩니다.');
         var s = $('summary');
         s.style.display = 'block';
-        s.textContent =
-          '[' + reason + ']\n' +
-          '처리 ' + idx + ' / ' + queue.length + '\n' +
-          'ok ' + counts.ok + ' · fail ' + counts.fail + ' · check ' + counts.check +
-          ' · skip ' + counts.skip + ' · error ' + counts.error + ' · 통신실패 ' + commFails +
-          (counts.fail > 0 ? '\n\nfail 행의 V열(리포트)·W열(감사)을 검토하세요.' : '') +
-          ((counts.error > 0 || commFails > 0) ? '\nerror/미기록 행은 같은 범위 재실행 또는 "Error 행 재검증"으로 처리됩니다.' : '');
+        s.textContent = lines.join('\n');
         addLog('=== ' + reason + ' ===', 'log-sys');
         updateProgress();
       }

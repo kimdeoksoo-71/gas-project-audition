@@ -1,5 +1,9 @@
 /*************************************************
- * PipelineVerify.gs — 원클릭 검증 파이프라인  v1 (2026-09-01)
+ * PipelineVerify.gs — 원클릭 검증 파이프라인  v1.1 (2026-09-14)
+ *
+ *  v1.1 패치: 키워드·A열 key 비교를 유니코드 NFC 정규화 후 수행
+ *   - macOS/Drive 파일명에서 복사한 한글은 NFD(자모 분리) 형태라
+ *     Latex변환 Data_DS 의 key(NFC) 와 문자열이 달라 "일치 0건" 이 났음
  *
  *  [메뉴] ▶️ 파이프라인 시작   : pv_start
  *  [메뉴] ⏯ 이어하기          : pv_resume
@@ -115,8 +119,8 @@ function pv_start() {
     ui.ButtonSet.OK_CANCEL);
   if (res.getSelectedButton() !== ui.Button.OK) return;
   const keywords = Array.from(new Set(
-    String(res.getResponseText() || '').split(/[,\n;]+/).map(s => s.trim()).filter(Boolean)
-  ));
+    String(res.getResponseText() || '').split(/[,\n;]+/).map(s => pv_nfc_(s).trim()).filter(Boolean)
+  ));   // v1.1: NFC 정규화 (파일명 복사 시 NFD 한글 대응)
   if (!keywords.length) { ui.alert('키워드가 비어 있습니다.'); return; }
 
   // ── 3. D1: 기존 Data_DS 데이터 보호 ──
@@ -474,6 +478,12 @@ function pv_latexFileId_() {
  * load: Latex변환 Data_DS!A~K에서 키워드 포함 행 검색 →
  * 문제검토 Data_DS 초기화(A~AC) 후 A~K 붙여넣기
  */
+/** 유니코드 NFC 정규화 (한글 NFD/NFC 불일치 흡수 — latex-convert 의 nfc_ 와 동일) */
+function pv_nfc_(s) {
+  s = String(s == null ? '' : s);
+  return s.normalize ? s.normalize('NFC') : s;
+}
+
 function pv_load_(ss, keywords) {
   const srcSs = SpreadsheetApp.openById(pv_latexFileId_());
   const src = srcSs.getSheetByName(PV.LATEX_SRC_SHEET);
@@ -483,7 +493,7 @@ function pv_load_(ss, keywords) {
   if (last < 2) throw new Error('Latex변환 Data_DS에 데이터가 없습니다.');
 
   const vals = src.getRange(2, 1, last - 1, 11).getValues();   // A~K
-  const kws = keywords.map(k => k.toLowerCase());
+  const kws = keywords.map(k => pv_nfc_(k).toLowerCase());   // v1.1: NFC 비교
 
   const excludedNoE = [];
   const rowsOut = [];
@@ -491,7 +501,7 @@ function pv_load_(ss, keywords) {
   vals.forEach((r, i) => {
     const key = String(r[0] || '').trim();
     if (!key) return;
-    const kl = key.toLowerCase();
+    const kl = pv_nfc_(key).toLowerCase();                      // v1.1: NFC 비교
     if (!kws.some(k => kl.indexOf(k) !== -1)) return;
     found++;
     if (String(r[4] || '').trim() === '') {   // E열(정규화 문제) 빈 행 제외 (D6)

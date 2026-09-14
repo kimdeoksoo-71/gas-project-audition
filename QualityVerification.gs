@@ -1,7 +1,27 @@
 /**
  * ============================================================
- * QualityVerification.gs — STEP 3: 해설 논리 검증 (v4)
+ * QualityVerification.gs — STEP 3: 해설 논리 검증 + STEP 4: 해설 군더더기 검출 (v5)
  * ============================================================
+ * v5 변경사항 (2026-09-10, STEP4 군더더기 검출 — "논리 분리 · 운영 통합"):
+ *   - STEP4 신설: 결론에 영향을 주지 않아도 없어야 할 서술(군더더기) 3유형을 검출한다.
+ *       irrelevant(무관) / redundant(중복) / loose_equivalence(느슨한 서술)
+ *     1차 Gemini(gemini_garbage_verify) → 2차 Claude(claude_garbage_judge, 삭제 검사·동치 검사)
+ *     → 코드 합성. STEP3와 같은 뼈대이지만 프롬프트·Claude 호출·결과 열·어휘·상한을 **분리**한다.
+ *   - 결과 열: Z(26) garbage_verdict / AA(27) garbage_report / AB(28) garbage_audit  (AC는 여유)
+ *     어휘: clean / garbage / check / skip / error / timeout — U열의 ok/fail과 섞지 않는다
+ *     (fail은 Stack에서 "틀린 해설"의 집계 기준이라 군더더기가 들어가면 오염된다).
+ *   - STEP3 판정 로직(verifyQualityForRow_·Q_TYPES·synthesizeQuality_)·U/V/W/X 는 **무변경**.
+ *   - 운영은 통합: 실행기 하나(사이드바 모드 논리/군더더기/둘 다), 상태·중단 키 Q_* 공유,
+ *     파이프라인 quality 단계가 행마다 STEP3→STEP4 (Pipelineverify.gs, PV_RUN_GARBAGE 로 on/off).
+ *   - ⚠ 행당 서버 호출은 검증마다 따로다 — `둘 다`는 행마다 qr_processRow 를 두 번 부른다
+ *     (실행기 예산 270초에 STEP3 한 행이 100~200초라 한 호출에 합치면 timeout).
+ *   - ⚠ 대상 선별·재개·재검증은 U와 Z 를 **각각** 본다 — STEP3가 끝난 행에 군더더기만 소급할 수 있고,
+ *     군더더기 판정만 실패한 행은 Z만 error 라 STEP3를 다시 돌리지 않는다.
+ *   - escalate: 군더더기 판정자가 "이건 결함이다"를 발견하면 Z를 check 이상으로 올리고
+ *     AA에 [결함의심n] 블록을 남긴다. U열은 건드리지 않는다 — 사람이 V열과 대조한다.
+ *   - 프롬프트 원본은 Mathory `lib/verify/prompts.ts`(Phase 61h)이고 pmt 6행이 그것을 이식했다.
+ *     type 키·판정 잣대는 양쪽이 같다(Stack Z/AA 가 Mathory 프로브의 대조군이 된다).
+ *
  * v4 변경사항 (2026-09-06, 프롬프트 V2 대응 — 결함 유형 6종 확장):
  *   - 결함 유형 2종 → 6종: logic_gap(비약) / invalid_inference(오추론) /
  *     unwarranted_assumption(가정) / case_omission(경우누락) /
@@ -24,10 +44,12 @@
  *   - 기존 동기 실행(startQualityVerification)은 보조용으로 유지(에디터에서 호출 가능)
  *
  * 목적:
- *   해설의 논리 결함(비약·오추론·근거 없는 가정·경우 누락·충분성 미확인·불일치)을
+ *   [STEP3] 해설의 논리 결함(비약·오추론·근거 없는 가정·경우 누락·충분성 미확인·불일치)을
  *   비대칭 교차 검증으로 판정한다.
  *     [1차] Gemini(후보 생성, recall) → [2차] Claude(후보 판정, precision)
  *     → [합성] 코드 로직으로 U/V/W/X 기록
+ *   [STEP4] 해설의 군더더기(무관·중복·느슨한 서술)를 같은 뼈대로 검출한다 (v5, 2-G 절).
+ *     [1차] Gemini(후보) → [2차] Claude(삭제 검사·동치 검사, "확신할 때만 valid") → [합성] Z/AA/AB 기록
  *
  * 설계 원칙:
  *   - STEP 1·2(ItemVerification)와 완전 분리. 트리거 체인 미사용(메뉴 수동 실행).
@@ -40,8 +62,12 @@
  *   V(22) Q_REPORT    확정 결함 리포트 (valid 판정만, 사람이 읽는 결과)
  *   W(23) Q_AUDIT     감사 추적: Gemini 후보 ↔ Claude 판정 대조 (파일럿 정밀도 측정용)
  *   X(24) JUDGE_MODEL 2차 판정 Claude 모델명 (Claude 미호출 시 빈칸)
+ *   (v5) Z(26) garbage_verdict  clean/garbage/check/skip/error/timeout
+ *   (v5) AA(27) garbage_report  확정 군더더기 리포트 [무관n]/[중복n]/[느슨n] + 결함 의심 [결함의심n]
+ *   (v5) AB(28) garbage_audit   감사 추적 (첫 줄 judge=모델·후보 수)
  *
  * ScriptProperties:
+ *   PV_RUN_GARBAGE   (선택, v5) 'false' 면 파이프라인 quality 단계에서 STEP4 를 건너뜀 (미설정 = 실행)
  *   CLAUDE_API_KEY   (필수) Anthropic API 키
  *   Q_GEMINI_MODEL   (선택) 기본 gemini-3.1-pro-preview — STEP3 전용 1차 모델(전환 메뉴와 무관하게 고정)
  *   Q_CLAUDE_MODEL   (선택) 기본 claude-opus-4-8
@@ -100,12 +126,31 @@ const QCONFIG = {
     JUDGE_MODEL: 24,  // X
   },
 
+  /* v5: STEP4 군더더기 검출 — 결함 검증(U~X)과 열·어휘·상한을 분리한다.
+     모델·예산·재시도·STEM/SOLUTION 은 상위 QCONFIG 를 그대로 쓴다(사본 금지). */
+  G: {
+    MAX_CANDIDATES: 6,   // 군더더기는 모든 해설에 조금씩 있어 상한을 먼저 채운다 — 1차 정렬 지시(느슨→중복→무관)와 짝
+    COL: {
+      G_VERDICT: 26,     // Z   clean / garbage / check / skip / error / timeout
+      G_REPORT:  27,     // AA  [느슨1]·[중복1]·[무관1]·[결함의심1] 지점/근거/제안
+      G_AUDIT:   28,     // AB  첫 줄 judge=<모델>·후보 k건 + 후보별 감사줄
+    },                   // AC(29)는 여유로 남긴다. Movetostack 이 A~AC 를 통째로 이관하므로 Stack 에도 같은 자리.
+    HEADERS: { 26: 'garbage_verdict', 27: 'garbage_report', 28: 'garbage_audit' },
+  },
+  /* 파이프라인 스위치(ScriptProperty). 'false' 일 때만 STEP4 를 건너뛴다 — 미설정 = 실행. 실행기는 모드로 고른다. */
+  RUN_GARBAGE_PROP: 'PV_RUN_GARBAGE',
+
   PROP: {
     STOP:      'Q_STOP',
     RUNNING:   'Q_RUNNING',
     HEARTBEAT: 'Q_LAST_HEARTBEAT',
   },
 };
+
+/** v5: 파이프라인이 STEP4 를 돌릴지 (PV_RUN_GARBAGE !== 'false') */
+function q_runGarbageEnabled_() {
+  return PropertiesService.getScriptProperties().getProperty(QCONFIG.RUN_GARBAGE_PROP) !== 'false';
+}
 
 
 /* ═══════════════════════════════════════════════
@@ -242,10 +287,10 @@ function startQualityVerification() {
   }
 }
 
-/** 메뉴 호출: STEP3 중단 요청 */
+/** 메뉴 호출: STEP3·STEP4 중단 요청 (실행기·동기 실행·파이프라인 quality 단계 공통 — Q_STOP 하나) */
 function stopQualityVerification() {
   PropertiesService.getScriptProperties().setProperty(QCONFIG.PROP.STOP, 'true');
-  SpreadsheetApp.getActiveSpreadsheet().toast('논리 검증 중단 요청됨. 현재 행 처리 후 멈춥니다.');
+  SpreadsheetApp.getActiveSpreadsheet().toast('논리·군더더기 검증 중단 요청됨. 현재 작업 처리 후 멈춥니다.');
 }
 
 /** pmt 시트에서 STEP3 프롬프트 2세트 로드 (system/user 필수 검증) */
@@ -489,6 +534,263 @@ function synthesizeQuality_(candidates, judgments, truncNote) {
 
 
 /* ═══════════════════════════════════════════════
+   2-G. STEP 4: 해설 군더더기 검출 (v5)
+   ═══════════════════════════════════════════════
+   STEP3 와 같은 뼈대(1차 Gemini 후보 → 2차 Claude 판정 → 코드 합성)를 쓰되
+   프롬프트·Claude 호출·결과 열(Z/AA/AB)·어휘(clean/garbage/check)·상한(6)을 분리한다.
+   API 호출기·그림 수집·LaTeX 복구·quote 정규화는 STEP3 의 헬퍼를 그대로 호출한다.
+
+   판정 잣대(프롬프트가 수행):
+     irrelevant / redundant → 삭제 검사: 그 대목을 지워도 (문제 조건 + 남은 풀이)로 논증이 완결되는가
+     loose_equivalence     → 동치 검사: ⟺ 한 줄로 쓸 수 있고 고교 과정에서 자명하며 결론은 옳은가
+   경계는 하나 — 결론이 안전한가. 위태로우면 결함(STEP3 몫) → 2차가 escalate 로 표시.
+
+   ⚠ STEP3 의 normalizeCandidateType_ 를 재사용하지 말 것 — 폴백이 logic_gap 이라 군더더기가 결함으로 샌다.
+   ⚠ 2차 성향은 STEP3 와 반대다("확신할 때만 valid"). 프롬프트를 STEP3 판정자에 합치지 말 것. */
+
+/** pmt 시트에서 STEP4 프롬프트 2세트 로드 (system/user 필수 검증) */
+function loadGarbagePrompts_() {
+  const gem   = getPromptSet('gemini_garbage_verify');
+  const judge = getPromptSet('claude_garbage_judge');
+  if (!gem.system || !gem.user || !judge.system || !judge.user) return null;
+  return { gem: gem, judge: judge };
+}
+
+/**
+ * v5: 군더더기 유형 정의 (단일 출처). label 은 AA열 블록 제목 "[라벨n]".
+ * ⚠ 순서가 정규화의 우선순위다: irrelevant → redundant → loose_equivalence.
+ *    '불필요'.includes('필요') 가 참이라 느슨 힌트에 '필요'·'충분'을 두면 '불필요'가 느슨으로 샌다(Mathory 61h E3) —
+ *    느슨 힌트는 loose/equiv/necess/suffic/느슨/동치/iff 만, 그리고 irrelevant 를 먼저 본다('unnecess' 가 'necess' 보다 먼저 걸린다).
+ */
+const G_TYPES = {
+  irrelevant:        { label: '무관', hints: ['irrelev', 'unrelat', 'unnecess', '무관', '불필요'] },
+  redundant:         { label: '중복', hints: ['redund', 'repet', 'duplic', '중복', '중언'] },
+  loose_equivalence: { label: '느슨', hints: ['loose', 'equiv', 'necess', 'suffic', '느슨', '동치', 'iff'] },
+};
+const G_TYPE_FALLBACK = 'irrelevant';
+/** AA열 [결함의심n] 블록에 적을 STEP3 유형 라벨 — escalate_tag 가 STEP3 type 키로 온다 */
+function g_escalateLabel_(tag) {
+  const t = String(tag || '').trim().toLowerCase().replace(/[\s\-]+/g, '_');
+  if (Q_TYPES[t]) return Q_TYPES[t].label;
+  // 한글/변형 키 흡수 (Mathory 태그가 그대로 올 수도 있다)
+  if (/충분|suffic/.test(t)) return Q_TYPES.sufficiency_unchecked.label;
+  if (/경우|case|omiss/.test(t)) return Q_TYPES.case_omission.label;
+  if (/가정|assum|unwarrant/.test(t)) return Q_TYPES.unwarranted_assumption.label;
+  if (/비약|gap/.test(t)) return Q_TYPES.logic_gap.label;
+  if (/불일치|일관|incons/.test(t)) return Q_TYPES.inconsistency.label;
+  return Q_TYPES.invalid_inference.label;   // 논리오류/invalid_inference/미지 → 오추론
+}
+
+/** 1차 응답의 type 을 G_TYPES 키로 정규화. 정확 일치 → 부분 문자열 → 폴백(irrelevant) */
+function normalizeGarbageType_(raw) {
+  const t = String(raw || '').trim().toLowerCase().replace(/[\s\-]+/g, '_');
+  if (Object.prototype.hasOwnProperty.call(G_TYPES, t)) return t;
+  const keys = Object.keys(G_TYPES);
+  for (let k = 0; k < keys.length; k++) {
+    const hints = G_TYPES[keys[k]].hints;
+    for (let h = 0; h < hints.length; h++) {
+      if (t.indexOf(hints[h]) !== -1) return keys[k];
+    }
+  }
+  return G_TYPE_FALLBACK;
+}
+
+/** Gemini 군더더기 후보 정제 (STEP3 sanitizeCandidates_ 등가, type 정규화만 교체) */
+function sanitizeGarbageCandidates_(arr) {
+  const out = [];
+  for (let i = 0; i < arr.length; i++) {
+    const c = arr[i] || {};
+    const quote  = repairLatexControlChars_(String(c.quote  || '')).trim();
+    const reason = repairLatexControlChars_(String(c.reason || '')).trim();
+    const type   = normalizeGarbageType_(c.type);
+    if (quote === '' && reason === '') continue;
+    out.push({ id: 'c' + (out.length + 1), type: type, quote: quote, reason: reason });
+  }
+  return out;
+}
+
+/** Data_DS 열 폭(≥AB)과 Z1/AA1/AB1 헤더 보장 (빈 칸일 때만 — 패치 13 iv_ensureFigInfoHeader_ 방식) */
+function g_ensureHeaders_(sheet) {
+  try {
+    const cols = QCONFIG.G.COL;
+    const maxCol = Math.max(cols.G_VERDICT, cols.G_REPORT, cols.G_AUDIT);
+    if (sheet.getMaxColumns() < maxCol) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(), maxCol - sheet.getMaxColumns());
+    }
+    Object.keys(QCONFIG.G.HEADERS).forEach(function (col) {
+      const cell = sheet.getRange(1, Number(col));
+      if (!String(cell.getValue() || '').trim()) cell.setValue(QCONFIG.G.HEADERS[col]);
+    });
+  } catch (e) {
+    Logger.log('[STEP4] 헤더 보장 실패(무시): ' + e.message);
+  }
+}
+
+/** Z/AA/AB 3열 일괄 기록 */
+function writeGarbageRow_(sheet, row, verdict, report, audit) {
+  sheet.getRange(row, QCONFIG.G.COL.G_VERDICT, 1, 3).setValues([[verdict, report, audit]]);
+}
+
+/**
+ * 한 행에 대해 STEP4 전체 흐름 수행 후 Z/AA/AB 기록. U/V/W/X 는 건드리지 않는다.
+ * API 실패는 내부에서 Z='error' 로 기록하고 'error' 를 반환한다(throw 하지 않음).
+ *
+ * @param {Sheet}  sheet     Data_DS 시트
+ * @param {number} row       행 번호
+ * @param {Object} gPrompts  loadGarbagePrompts_() 결과
+ * @param {number} budgetMs  이 행에 허용된 총 시간(ms)
+ * @return {string} 'clean' | 'garbage' | 'check' | 'skip' | 'error'
+ */
+function verifyGarbageForRow_(sheet, row, gPrompts, budgetMs) {
+  const rowStart = Date.now();
+  const C = QCONFIG.COL;
+
+  const stem     = String(sheet.getRange(row, C.STEM).getValue()     || '').trim();
+  const solution = String(sheet.getRange(row, C.SOLUTION).getValue() || '').trim();
+
+  if (solution === '') {
+    writeGarbageRow_(sheet, row, 'skip', '', 'C열(풀이) 비어있음');
+    return 'skip';
+  }
+
+  try {
+    const imgs = (typeof iv_imageParts_ === 'function') ? iv_imageParts_([stem, solution]) : [];
+    const note = (typeof iv_imageNote_ === 'function') ? iv_imageNote_(imgs) : '';
+
+    // ── [1차] Gemini 후보 생성 — ★ 함수형 치환($$/$& 패턴 보호) ──
+    const gemUser = gPrompts.gem.user
+      .replace(/\{problem\}/g,  function () { return stem; })
+      .replace(/\{solution\}/g, function () { return solution; }) + note;
+
+    const gemBudget = Math.max((budgetMs - (Date.now() - rowStart)) / 2, QCONFIG.API_CALL_RESERVE_MS);
+    const gemParsed = callGeminiForQuality_(gPrompts.gem.system, gemUser, gPrompts.gem.assistant, gemBudget, imgs);
+
+    if (!Array.isArray(gemParsed.candidates)) {
+      throw new Error('Gemini 응답에서 candidates 배열을 파싱하지 못했습니다.');
+    }
+
+    let candidates = sanitizeGarbageCandidates_(gemParsed.candidates);
+    if (candidates.length === 0) {
+      writeGarbageRow_(sheet, row, 'clean', '', 'judge=— · (후보 없음)');
+      return 'clean';
+    }
+
+    let truncNote = '';
+    if (candidates.length > QCONFIG.G.MAX_CANDIDATES) {
+      truncNote = `(후보 ${candidates.length}개 중 ${QCONFIG.G.MAX_CANDIDATES}개만 판정)`;
+      candidates = candidates.slice(0, QCONFIG.G.MAX_CANDIDATES);
+    }
+
+    const normSol = normalizeForQuoteCheck_(solution);
+    candidates.forEach(function (c) {
+      c._quoteFound = normSol.indexOf(normalizeForQuoteCheck_(c.quote)) !== -1;
+    });
+
+    // ── [2차] Claude 판정 (STEP3 와 별도 프롬프트·별도 호출) ──
+    const judgeUser = gPrompts.judge.user
+      .replace(/\{problem\}/g,    function () { return stem; })
+      .replace(/\{solution\}/g,   function () { return solution; })
+      .replace(/\{candidates\}/g, function () { return formatCandidatesForJudge_(candidates); }) + note;
+
+    const claudeBudget = budgetMs - (Date.now() - rowStart);
+    const judgeParsed = callClaudeWithRetry_(gPrompts.judge.system, judgeUser, claudeBudget, q_claudeImageBlocks_(imgs));
+
+    if (!Array.isArray(judgeParsed.judgments)) {
+      throw new Error('Claude 응답에서 judgments 배열을 파싱하지 못했습니다.');
+    }
+
+    const synth = synthesizeGarbage_(candidates, judgeParsed.judgments, truncNote);
+    writeGarbageRow_(sheet, row, synth.verdict, synth.report, synth.audit);
+    return synth.verdict;
+
+  } catch (e) {
+    Logger.log(`STEP4 row ${row} error: ${e.message}`);
+    writeGarbageRow_(sheet, row, 'error', '', `[Error] ${String(e.message).slice(0, 400)}`);
+    return 'error';
+  }
+}
+
+/**
+ * STEP4 합성 (순수 코드 로직)
+ *  - valid ≥ 1      → 'garbage'   (AA열에 확정 군더더기 블록)
+ *  - uncertain ≥ 1  → 'check'
+ *  - 그 외          → 'clean'
+ *  - escalate ≥ 1   → clean 이면 'check' 로 올리고 AA에 [결함의심n] 블록 (U열은 건드리지 않는다)
+ *  - 판정 누락·미지 값은 uncertain (STEP3 와 동일)
+ *  - suggestion 은 valid 일 때만 싣는다 (Mathory 61h 실측: 판정자가 uncertain 에도 제안을 붙인다 → 코드로 강제)
+ */
+function synthesizeGarbage_(candidates, judgments, truncNote) {
+  const byId = {};
+  judgments.forEach(function (j) {
+    if (j && j.id) byId[String(j.id).trim()] = j;
+  });
+
+  const counter = {};
+  Object.keys(G_TYPES).forEach(function (k) { counter[k] = 0; });
+  let escCounter = 0;
+  const labelOf = function (type) {
+    return (G_TYPES[type] && G_TYPES[type].label) || G_TYPES[G_TYPE_FALLBACK].label;
+  };
+
+  const reportBlocks = [];
+  const auditLines = [];
+  let validCnt = 0, uncertainCnt = 0, escalateCnt = 0;
+
+  candidates.forEach(function (c) {
+    const j = byId[c.id];
+    let ruling = j ? String(j.ruling || '').toLowerCase().trim() : '';
+    let note   = j ? repairLatexControlChars_(String(j.note || '')).trim() : '';
+    const suggestion = j ? repairLatexControlChars_(String(j.suggestion || '')).trim() : '';
+    const escalate   = !!(j && j.escalate === true);
+    const escTag     = j ? String(j.escalate_tag || '').trim() : '';
+    if (ruling !== 'valid' && ruling !== 'invalid' && ruling !== 'uncertain') {
+      ruling = 'uncertain';
+      note = note || '판정 누락';
+    }
+
+    if (escalate) {
+      // 군더더기가 아니라 결함 의심 — ruling 과 무관하게 사람에게 보인다. U열 무접촉.
+      escalateCnt++;
+      escCounter++;
+      reportBlocks.push(
+        '[결함의심' + escCounter + ']\n' +
+        '지점: ' + c.quote + '\n' +
+        '근거: [군더더기 검토에서 격상] ' + (note || c.reason) + '\n' +
+        'STEP3 유형: ' + g_escalateLabel_(escTag) + ' → U/V열과 대조'
+      );
+    } else if (ruling === 'valid') {
+      validCnt++;
+      if (!Object.prototype.hasOwnProperty.call(counter, c.type)) counter[c.type] = 0;
+      counter[c.type]++;
+      reportBlocks.push(
+        '[' + labelOf(c.type) + counter[c.type] + ']\n' +
+        '지점: ' + c.quote + '\n' +
+        '근거: ' + (note || c.reason) +
+        (suggestion ? '\n제안: ' + suggestion : '')
+      );
+    } else if (ruling === 'uncertain') {
+      uncertainCnt++;
+    }
+
+    auditLines.push(
+      '[' + c.id + '|' + c.type + (c._quoteFound === false ? '|quote원문불일치' : '') + '] ' +
+      c.quote + ' → Claude:' + ruling + (note ? ' (' + note + ')' : '') +
+      (escalate ? ' → escalate:' + (escTag || '?') : '')
+    );
+  });
+
+  let verdict = (validCnt >= 1) ? 'garbage' : (uncertainCnt >= 1 ? 'check' : 'clean');
+  if (escalateCnt >= 1 && verdict === 'clean') verdict = 'check';
+
+  let audit = 'judge=' + QCONFIG.CLAUDE_MODEL + ' · 후보 ' + candidates.length + '건' +
+              (truncNote ? ' ' + truncNote : '') +
+              (escalateCnt ? ' · 결함의심 ' + escalateCnt + '건' : '') + '\n' + auditLines.join('\n');
+
+  return { verdict: verdict, report: reportBlocks.join('\n\n'), audit: audit };
+}
+
+
+/* ═══════════════════════════════════════════════
    3. Gemini 호출 (STEP3 전용 — 모델 고정)
    ═══════════════════════════════════════════════
    기존 callGeminiUnified_는 전환 메뉴의 VCONFIG.GEMINI_MODEL을 사용하므로
@@ -711,55 +1013,103 @@ function testSingleQualityRow() {
 
   const qPrompts = loadQualityPrompts_();
   if (!qPrompts) {
-    ui.alert('프롬프트 로드 실패. pmt 시트의 key/role/enabled를 확인하세요.');
+    ui.alert('프롬프트 로드 실패. pmt 시트의 quality 세트(key/role/enabled)를 확인하세요.');
     return;
   }
+  // v5: 군더더기 세트는 없으면 STEP4 만 건너뛴다 (STEP3 테스트는 종전대로)
+  const gPrompts = loadGarbagePrompts_();
 
   const confirm = ui.alert(
-    '논리검증 단일 행 테스트',
-    `행 ${rowNum}에 대해 STEP3(Gemini→Claude→합성)를 실행합니다.\n` +
-    `U~X열이 덮어쓰기 됩니다. 진행할까요?`,
+    '논리·군더더기 단일 행 테스트',
+    `행 ${rowNum}에 대해 STEP3(논리 검증 → U~X열)` +
+    (gPrompts ? ` 와 STEP4(군더더기 검출 → Z~AB열)` : ``) + `를 차례로 실행합니다.\n` +
+    (gPrompts ? `` : `⚠ pmt 에 garbage 프롬프트 세트가 없어 STEP4 는 건너뜁니다.\n`) +
+    `해당 열이 덮어쓰기 됩니다. 진행할까요?`,
     ui.ButtonSet.YES_NO
   );
   if (confirm !== ui.Button.YES) return;
 
   ss.toast(`행 ${rowNum} 논리 검증 중... (최대 수 분 소요)`);
+  const t1 = Date.now();
   const status = verifyQualityForRow_(sheet, rowNum, qPrompts, QCONFIG.MAX_EXEC_MS);
+  const ms1 = Date.now() - t1;
   SpreadsheetApp.flush();
+  Logger.log(`[test] STEP3 row ${rowNum}: ${status} (${ms1}ms)`);
+
+  let gLine = 'STEP4: 건너뜀(프롬프트 없음)';
+  if (gPrompts) {
+    g_ensureHeaders_(sheet);
+    ss.toast(`행 ${rowNum} 군더더기 검출 중... (최대 수 분 소요)`);
+    const t2 = Date.now();
+    const gStatus = verifyGarbageForRow_(sheet, rowNum, gPrompts, QCONFIG.MAX_EXEC_MS);
+    const ms2 = Date.now() - t2;
+    SpreadsheetApp.flush();
+    Logger.log(`[test] STEP4 row ${rowNum}: ${gStatus} (${ms2}ms)`);
+    gLine = `STEP4(군더더기, Z~AB): ${gStatus}  [${Math.round(ms2 / 1000)}s]`;
+  }
 
   ui.alert(
     '테스트 완료',
-    `행 ${rowNum} 결과: ${status}\n\nU~X열과 실행 로그(Logger)를 확인하세요.`,
+    `행 ${rowNum}\n` +
+    `STEP3(논리, U~X): ${status}  [${Math.round(ms1 / 1000)}s]\n` +
+    `${gLine}\n\n실행 로그(Logger)에서 원문 응답을 확인하세요.`,
     ui.ButtonSet.OK
   );
 }
 
 
 /* ═══════════════════════════════════════════════
-   6. v2: 사이드바 실행기 (QualityRunner)
+   6. 사이드바 실행기 (QualityRunner) — v2 신설 · v5 모드 통합
    ═══════════════════════════════════════════════
-   구조: 사이드바 JS가 행 1건당 서버 호출 1건(qr_processRow)을 연쇄 실행.
+   구조: 사이드바 JS가 (행, 검증) 1건당 서버 호출 1건(qr_processRow)을 연쇄 실행.
    각 호출은 독립적인 실행 예산을 가지므로 6분 한도에 걸리지 않고,
    사용자 상호작용 실행이라 트리거 일일 한도(90분)도 소모하지 않는다.
-   행 간 쿨다운은 서버측 sleep으로 처리(백그라운드 탭 타이머 스로틀 회피). */
+   행 간 쿨다운은 서버측 sleep으로 처리(백그라운드 탭 타이머 스로틀 회피).
 
-/** 메뉴 호출: 논리 검증 실행기 사이드바 열기 */
+   v5: 모드 quality(논리 검증만) / garbage(군더더기만) / both(둘 다, 기본).
+   ⚠ both 는 행마다 호출 2건(quality → garbage) — 한 호출에 합치지 않는다(예산 270초).
+   ⚠ 대상 선별은 U(STEP3)·Z(STEP4)를 각각 본다 — 이미 STEP3가 끝난 행에 군더더기만 소급할 수 있다. */
+
+/** 실행기 스텝별 설정 — 검증 함수·프롬프트 로더·verdict 열을 한 곳에서 고른다 */
+function qr_stepOf_(step) {
+  if (step === 'garbage') {
+    return { step: 'garbage', label: '군더더기', col: QCONFIG.G.COL.G_VERDICT,
+             loadPrompts: loadGarbagePrompts_, verifyRow: verifyGarbageForRow_,
+             promptHint: 'garbage 세트(gemini_garbage_verify / claude_garbage_judge)' };
+  }
+  return { step: 'quality', label: '논리', col: QCONFIG.COL.Q_VERDICT,
+           loadPrompts: loadQualityPrompts_, verifyRow: verifyQualityForRow_,
+           promptHint: 'quality 세트(gemini_quality_verify / claude_quality_judge)' };
+}
+
+/** 모드 → 스텝 목록 (순서 = 실행 순서) */
+function qr_stepsOfMode_(mode) {
+  if (mode === 'quality') return ['quality'];
+  if (mode === 'garbage') return ['garbage'];
+  return ['quality', 'garbage'];   // 'both' · 미지정
+}
+
+/** 메뉴 호출: 논리·군더더기 검증 실행기 사이드바 열기 (모드는 사이드바에서 고른다) */
 function openQualityRunner() {
   const html = HtmlService.createHtmlOutputFromFile('QualityRunner')
-    .setTitle('논리 검증 실행기 (STEP 3)')
+    .setTitle('논리·군더더기 검증 실행기 (STEP 3·4)')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
 /**
- * 실행 시작: 사전 점검 + 대상 행 선별.
+ * 실행 시작: 사전 점검 + 대상 선별.
  * @param {string} rangeText  예: "2-101"
+ * @param {string} [mode]     'quality' | 'garbage' | 'both' (기본 'both'; 구 호출은 인자 없음 → both)
  * @return {Object} { ok:false, message } 또는
- *                  { ok:true, targets:number[], skippedDone:number,
+ *                  { ok:true, mode, targets:[{row, steps:string[]}], skippedDone:number,
  *                    geminiModel:string, claudeModel:string }
+ *   ⚠ targets 는 행마다 "아직 필요한 검증"만 담는다 — U/Z 를 각각 본 결과다.
  */
-function qr_start(rangeText) {
+function qr_start(rangeText, mode) {
   const props = PropertiesService.getScriptProperties();
+  mode = (mode === 'quality' || mode === 'garbage') ? mode : 'both';
+  const steps = qr_stepsOfMode_(mode);
 
   // 동시 실행 가드: STEP1·2 트리거 체인 진행 중이면 거부
   if (props.getProperty('V_RUNNING') === 'true') {
@@ -773,24 +1123,37 @@ function qr_start(rangeText) {
   if (!props.getProperty('GEMINI_API_KEY')) return { ok: false, message: 'GEMINI_API_KEY가 설정되지 않았습니다.' };
   if (!props.getProperty('CLAUDE_API_KEY')) return { ok: false, message: 'CLAUDE_API_KEY가 설정되지 않았습니다.' };
 
-  if (!loadQualityPrompts_()) {
-    return { ok: false, message: '프롬프트 로드 실패. pmt 시트의 quality 세트(key/role/enabled)를 확인하세요.' };
+  // 모드에 필요한 프롬프트 세트만 점검
+  for (let s = 0; s < steps.length; s++) {
+    const st = qr_stepOf_(steps[s]);
+    if (!st.loadPrompts()) {
+      return { ok: false, message: '프롬프트 로드 실패. pmt 시트의 ' + st.promptHint + ' key/role/enabled 를 확인하세요.' };
+    }
   }
 
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(QCONFIG.DATA_SHEET);
   if (!sheet) return { ok: false, message: 'Data_DS 시트를 찾을 수 없습니다.' };
+  if (steps.indexOf('garbage') !== -1) g_ensureHeaders_(sheet);
 
   const range = parseRowRange(rangeText);
   if (!range || range.startRow < 2) return { ok: false, message: '유효하지 않은 범위입니다. (예: 2-101)' };
 
-  // 대상 행 선별: U열이 비었거나 error/timeout인 행만 (완료 행 건너뛰기)
+  // 대상 선별: 스텝마다 그 verdict 열이 비었거나 error/timeout 인 행만 (완료 행 건너뛰기 — U/Z 각각)
   const numRows = range.endRow - range.startRow + 1;
-  const uVals = sheet.getRange(range.startRow, QCONFIG.COL.Q_VERDICT, numRows, 1).getValues();
+  const colVals = {};
+  steps.forEach(function (stepName) {
+    const st = qr_stepOf_(stepName);
+    colVals[stepName] = sheet.getRange(range.startRow, st.col, numRows, 1).getValues();
+  });
   const targets = [];
   let skippedDone = 0;
   for (let i = 0; i < numRows; i++) {
-    const u = String(uVals[i][0] || '').toLowerCase().trim();
-    if (u === '' || u === 'error' || u === 'timeout') targets.push(range.startRow + i);
+    const need = [];
+    steps.forEach(function (stepName) {
+      const v = String(colVals[stepName][i][0] || '').toLowerCase().trim();
+      if (v === '' || v === 'error' || v === 'timeout') need.push(stepName);
+    });
+    if (need.length) targets.push({ row: range.startRow + i, steps: need });
     else skippedDone++;
   }
 
@@ -802,6 +1165,7 @@ function qr_start(rangeText) {
 
   return {
     ok: true,
+    mode: mode,
     targets: targets,
     skippedDone: skippedDone,
     geminiModel: QCONFIG.GEMINI_MODEL,
@@ -810,34 +1174,37 @@ function qr_start(rangeText) {
 }
 
 /**
- * 행 1건 처리 (서버 호출 1건 = 독립 실행 예산).
+ * (행, 검증) 1건 처리 (서버 호출 1건 = 독립 실행 예산).
  * @param {number} row
- * @param {boolean} isFirst  첫 행이면 행 간 쿨다운 생략
- * @return {Object} { row, status } — status: ok/fail/check/skip/error/stopped
+ * @param {string|boolean} step  'quality' | 'garbage'.  ⚠ 구 시그니처 호환: boolean 이 오면 isFirst 로 읽고 step='quality'
+ * @param {boolean} isFirst  첫 작업이면 쿨다운 생략
+ * @return {Object} { row, step, status } — status: (quality) ok/fail/check/skip/error · (garbage) clean/garbage/check/skip/error · stopped
  */
-function qr_processRow(row, isFirst) {
+function qr_processRow(row, step, isFirst) {
+  if (typeof step === 'boolean') { isFirst = step; step = 'quality'; }   // v2 클라이언트 호환
+  const st = qr_stepOf_(step);
   const props = PropertiesService.getScriptProperties();
 
-  // 중단 확인 (사이드바 STOP 버튼 / 메뉴 '⛔ 논리검증 중단' / forceStopAll 모두 감지)
+  // 중단 확인 (사이드바 STOP 버튼 / 메뉴 '⛔ 논리·군더더기 검증 중단' / forceStopAll 모두 감지)
   if (props.getProperty(QCONFIG.PROP.STOP) === 'true') {
-    return { row: row, status: 'stopped' };
+    return { row: row, step: st.step, status: 'stopped' };
   }
 
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(QCONFIG.DATA_SHEET);
-  if (!sheet) return { row: row, status: 'error', message: 'Data_DS 시트를 찾을 수 없습니다.' };
+  if (!sheet) return { row: row, step: st.step, status: 'error', message: 'Data_DS 시트를 찾을 수 없습니다.' };
 
-  const qPrompts = loadQualityPrompts_();
-  if (!qPrompts) return { row: row, status: 'error', message: '프롬프트 로드 실패' };
+  const prompts = st.loadPrompts();
+  if (!prompts) return { row: row, step: st.step, status: 'error', message: '프롬프트 로드 실패(' + st.promptHint + ')' };
 
-  // 행 간 쿨다운: 서버측 sleep (백그라운드 탭 setTimeout 스로틀 회피)
+  // 작업 간 쿨다운: 서버측 sleep (백그라운드 탭 setTimeout 스로틀 회피)
   if (!isFirst) Utilities.sleep(QCONFIG.INTER_ROW_COOLDOWN_MS);
 
   props.setProperty(QCONFIG.PROP.HEARTBEAT, String(Date.now()));
 
-  const status = verifyQualityForRow_(sheet, row, qPrompts, QCONFIG.RUNNER_ROW_BUDGET_MS);
+  const status = st.verifyRow(sheet, row, prompts, QCONFIG.RUNNER_ROW_BUDGET_MS);
   SpreadsheetApp.flush();
 
-  return { row: row, status: status };
+  return { row: row, step: st.step, status: status };
 }
 
 /** 실행 종료 처리 (완료·중단 공통) */
@@ -846,7 +1213,7 @@ function qr_finish() {
   return true;
 }
 
-/** 사이드바 STOP 버튼: Q_STOP 설정 (현재 행 완료 후 정지) */
+/** 사이드바 STOP 버튼: Q_STOP 설정 (현재 작업 완료 후 정지) */
 function qr_requestStop() {
   PropertiesService.getScriptProperties().setProperty(QCONFIG.PROP.STOP, 'true');
   return true;

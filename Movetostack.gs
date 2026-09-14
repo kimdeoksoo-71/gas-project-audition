@@ -9,7 +9,8 @@
  *  - 세트명·문항그룹 열 이전: Y(25)/Z(26) → AD(30)/AE(31).
  *    Y~AC(25~29) 5열은 행 단위 데이터용 여유 열이 됨.
  *    · Y(25) = fig_info (패치 13: 그림 첨부/누락 내역, Data_DS에서 그대로 이관)
- *    · Z~AC(26~29) = 향후 확장용 (Data_DS 같은 위치의 값이 그대로 이관됨)
+ *    · Z~AB(26~28) = (v5) STEP4 군더더기 검출 결과 garbage_verdict / garbage_report / garbage_audit
+ *    · AC(29)      = 향후 확장용 (Data_DS 같은 위치의 값이 그대로 이관됨)
  *  - 이관 폭 24열(A~X) → 29열(A~AC)
  *  - 기존 Stack의 Y/Z 값을 AD/AE로 옮기는 1회성 마이그레이션 메뉴
  *    (mts_migrateSetCols) 추가 — ⚠️ v4 첫 사용 전 반드시 1회 실행할 것.
@@ -207,13 +208,17 @@ function mts_core_() {
   };
 }
 
-/** v4: Stack 헤더 보장 — Y1 'fig_info', AD1 '세트명', AE1 '문항그룹' (빈 칸일 때만) */
+/** v4: Stack 헤더 보장 — Y1 'fig_info', AD1 '세트명', AE1 '문항그룹' (빈 칸일 때만)
+ *  v5: Z1/AA1/AB1 STEP4 군더더기 열 헤더 추가 (Data_DS 와 같은 자리 — A~AC 통째 이관이라 이관 코드는 무변경) */
 function mts_ensureHeaders_(dstSheet) {
   const put = (col, name) => {
     const cell = dstSheet.getRange(1, col);
     if (!String(cell.getValue() || '').trim()) cell.setValue(name);
   };
   put(MTS.OLD_COL_SET, 'fig_info');   // Y (구 세트명 자리 — 마이그레이션 후 비어 있음)
+  put(26, 'garbage_verdict');         // Z   (v5 STEP4)
+  put(27, 'garbage_report');          // AA  (v5 STEP4)
+  put(28, 'garbage_audit');           // AB  (v5 STEP4)
   put(MTS.COL_SET, '세트명');          // AD
   put(MTS.COL_GROUP, '문항그룹');      // AE
 }

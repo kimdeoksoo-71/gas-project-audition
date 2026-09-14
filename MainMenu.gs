@@ -31,13 +31,13 @@ function onOpen() {
     .addItem('⏺️ 문항 정규화', 'ds_runNormalizeAndValidate_byRowInput')
     .addSeparator()
     .addItem('▶️ 문항 검증 (문제+해설)', 'startItemVerification')
-    .addItem('🧠 논리 검증 (해설 논증)', 'openQualityRunner')
+    .addItem('🧠 논리·군더더기 검증 (해설)', 'openQualityRunner')        // v5: STEP3+STEP4 — 실행기에서 모드 선택
     .addItem('🔄 Error 행 재검증', 'retryErrorRows')
     .addItem('✅ 진행 상태 확인', 'checkVerificationStatus')
     .addItem('🧪 단일 행 테스트', 'testSingleRowVerification')
-    .addItem('🧪 논리검증 단일행 테스트', 'testSingleQualityRow')
+    .addItem('🧪 논리·군더더기 단일행 테스트', 'testSingleQualityRow')   // v5: STEP3 → STEP4 차례로
     .addItem('⛔ 작업 중단', 'stopItemVerification')
-    .addItem('⛔ 논리검증 중단', 'stopQualityVerification')
+    .addItem('⛔ 논리·군더더기 검증 중단', 'stopQualityVerification')
     .addSeparator()
     .addItem('🤖 모델 전환', 'switchGeminiModel')
     .addItem('ℹ️ 현재 모델 확인', 'showCurrentModel')
