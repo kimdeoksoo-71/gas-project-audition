@@ -29,6 +29,15 @@
  *   - 429 spending cap 에러 즉시 중단 (무의미한 재시도 방지)
  *   - 기본 모델: gemini-3.5-flash (thinking_level: high)
  * ============================================================
+ * 패치 14 (2026-09-17): 치명적 API 오류 시 작업 즉시 멈춤
+ *   - 원인: 월 지출 한도(spending cap) 초과 후 남은 행이 전부 error 로 기록되며 계속 진행됨
+ *   - 치명적 오류(Gemini 월 지출 한도·선불 크레딧 소진·일일 한도 / Claude 크레딧·결제)를
+ *     iv_markFatal_ 이 전역 플래그 + 스크립트 속성 API_FATAL 에 기록 → 호출자가 루프를 멈춤
+ *   - 일반 429(분당 한도)는 이제 재시도 대상 (종전: RESOURCE_EXHAUSTED 면 무조건 영구 에러)
+ *   - Gemini 오류 메시지에 quotaId 를 덧붙여 일일/분당 한도를 구분 (iv_geminiHttpError_)
+ *   - 큐가 멈추면 V_CURRENT·V_END 를 보존하고 V_HALTED='true' → 검증 시작 메뉴에서 이어하기 제안
+ *   - API_FATAL 은 새 작업 시작 지점(검증 시작·재검증·STEP3 메뉴·실행기·파이프라인 시작/이어하기)에서 지움
+ * ============================================================
  */
 
 /* ─── 모델 프리셋 ─── */
@@ -109,6 +118,7 @@ const VCONFIG = {
     BATCH:     'V_BATCH_SIZE',
     RUNNING:   'V_RUNNING',
     HEARTBEAT: 'V_LAST_HEARTBEAT',  // v3: 마지막 진척 시각(ms)
+    HALTED:    'V_HALTED',          // 패치 14: 치명적 API 오류로 멈춤 ('true'면 이어하기 가능)
   },
 
   TRIGGER_FN: 'processVerificationQueue',
@@ -144,6 +154,10 @@ function startItemVerification() {
   if (staleResult === 'cancel' || staleResult === 'resumed') return;
   // 'continue'이면 새 작업 진행
 
+  // ── 패치 14: API 한도 초과로 멈춘 작업이 있으면 이어하기 제안 ──
+  const haltResult = iv_offerHaltedResume_(ui);
+  if (haltResult === 'cancel' || haltResult === 'resumed') return;
+
   const input = ui.prompt(
     '문항 검증 (문제 + 해설)',
     '검증할 행 범위를 입력하세요 (예: 2-100)',
@@ -161,8 +175,10 @@ function startItemVerification() {
   if (!apiKey) { ui.alert('GEMINI_API_KEY가 설정되지 않았습니다.'); return; }
 
   deleteVerifyTriggers_();
+  iv_clearFatal_();   // 패치 14
 
   const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(VCONFIG.PROP.HALTED);   // 패치 14
   props.setProperties({
     [VCONFIG.PROP.CURRENT]:   String(range.startRow),
     [VCONFIG.PROP.END]:       String(range.endRow),
@@ -205,6 +221,17 @@ function checkVerificationStatus() {
   const heartbeat = parseInt(props.getProperty(VCONFIG.PROP.HEARTBEAT), 10);
 
   if (!current || !end || running !== 'true') {
+    // 패치 14: 한도 초과로 멈춘 작업 안내
+    if (props.getProperty(VCONFIG.PROP.HALTED) === 'true' && current && end) {
+      ui.alert(
+        `⛔ API 한도 초과로 멈춘 작업이 있습니다.\n\n` +
+        `사유: ${iv_getFatal_() || '(기록 없음)'}\n` +
+        `멈춘 위치: 행 ${current} / 종료 행 ${end}\n\n` +
+        `한도를 조정한 뒤 [▶️ 문항 검증] 메뉴에서 이어하기를 선택하세요.\n` +
+        `(원클릭 파이프라인에서 멈춘 경우 파이프라인의 [⏯ 이어하기]를 사용)`
+      );
+      return;
+    }
     ui.alert('현재 실행 중인 작업이 없습니다.');
     return;
   }
@@ -397,6 +424,13 @@ function processVerificationQueue() {
       Logger.log(`Row ${currentRow} error: ${e.message}`);
       sheet.getRange(currentRow, VCONFIG.COL.P_VERDICT).setValue('error');
       sheet.getRange(currentRow, VCONFIG.COL.P_NOTE).setValue(`[Error] ${e.message}`);
+
+      // ── 패치 14: 치명적 API 오류 → 이 행만 error 로 남기고 큐 즉시 정지 (남은 행은 빈칸 유지) ──
+      const fatal = iv_getFatal_();
+      if (fatal) {
+        iv_haltVerifyQueue_(currentRow, fatal);
+        return;
+      }
 
       // v4: 503 에러인 경우 연속 카운터 증가
       if (e.message && e.message.includes('503')) {
@@ -793,17 +827,190 @@ function callGeminiWithRetry_(sys, usr, ast, timeBudgetMs, imgParts) {   // 패�
   }
 }
 
+/* ═══════════════════════════════════════════════
+   패치 14: 치명적 API 오류 감지·기록·해제
+   ═══════════════════════════════════════════════
+   - 치명적 = 기다려도(수 분) 풀리지 않아 재시도·다음 행 진행이 무의미한 오류
+       · Gemini 월 지출 한도(spending cap) 초과
+       · Gemini 선불 크레딧 소진
+       · Gemini 일일 요청 한도(quotaId 에 PerDay) 초과
+       · Claude 크레딧 부족 / 결제 문제
+   - 전역 변수(같은 실행 안) + 스크립트 속성 API_FATAL(실행 간: 파이프라인 폴링·실행기)
+   - 호출자는 행 처리 후 iv_getFatal_() 로 확인하고 루프를 멈춘다
+   - 해제는 새 작업을 시작하는 지점에서 iv_clearFatal_() */
+
+const IV_FATAL_PROP = 'API_FATAL';
+let IV_API_FATAL_ = '';
+
+/** 오류 메시지 → 치명적 사유 라벨 (치명적이 아니면 '') */
+function iv_classifyFatal_(errorMsg) {
+  const msg = String(errorMsg || '');
+
+  // Claude: 크레딧/결제 계열 (Gemini 429 본문에도 "billing" 단어가 나오므로 Claude 메시지로 한정)
+  if (msg.indexOf('Claude API') !== -1) {
+    if (/credit balance|purchase credits|billing/i.test(msg)) {
+      return 'Anthropic 크레딧/결제 문제 — https://console.anthropic.com 확인';
+    }
+    return '';
+  }
+
+  if (/spending cap/i.test(msg)) {
+    return 'Gemini 월 지출 한도 초과 — https://ai.studio/spend 에서 한도 확인';
+  }
+  if (/prepayment credits?.*depleted|credits? (are|is|have been) depleted/i.test(msg)) {
+    return 'Gemini 선불 크레딧 소진 — AI Studio 결제 확인';
+  }
+  if (msg.indexOf('(429)') !== -1 && /PerDay|per day/i.test(msg)) {
+    return 'Gemini 일일 요청 한도 초과 — 한도 초기화(태평양 시간 자정) 후 재개';
+  }
+  return '';
+}
+
+/** 치명적이면 기록하고 라벨 반환, 아니면 '' */
+function iv_markFatal_(errorMsg) {
+  const label = iv_classifyFatal_(errorMsg);
+  if (!label) return '';
+  if (!IV_API_FATAL_) {
+    IV_API_FATAL_ = label;
+    try {
+      PropertiesService.getScriptProperties().setProperty(IV_FATAL_PROP, JSON.stringify({
+        label: label,
+        at: new Date().toISOString(),
+        detail: String(errorMsg).slice(0, 300),
+      }));
+    } catch (_) {}
+    Logger.log(`[FATAL] ${label} | ${String(errorMsg).slice(0, 200)}`);
+  }
+  return label;
+}
+
+/** 현재 치명적 오류 라벨 ('' = 없음). 같은 실행이면 전역, 아니면 스크립트 속성 */
+function iv_getFatal_() {
+  if (IV_API_FATAL_) return IV_API_FATAL_;
+  const s = PropertiesService.getScriptProperties().getProperty(IV_FATAL_PROP);
+  if (!s) return '';
+  try {
+    IV_API_FATAL_ = JSON.parse(s).label || '치명적 API 오류';
+  } catch (_) {
+    IV_API_FATAL_ = '치명적 API 오류';
+  }
+  return IV_API_FATAL_;
+}
+
+/** 치명적 오류 표시 해제 (새 작업 시작 시) */
+function iv_clearFatal_() {
+  IV_API_FATAL_ = '';
+  PropertiesService.getScriptProperties().deleteProperty(IV_FATAL_PROP);
+}
+
 /**
- * v5: 재시도 가능 여부 판별 — spending cap 429는 영구 에러로 분류
- * 503, 429(일반), 500, 502, 504 → 재시도 가능
- * 429(spending cap), 400, 401, 403, 404 → 영구 실패
+ * Gemini HTTP 오류 → Error. 메시지 앞부분 + status + quotaId 목록을 담는다.
+ * (종전 slice(0,300)은 quotaId 가 잘려 일일/분당 한도를 구분할 수 없었음)
+ */
+function iv_geminiHttpError_(code, bodyText) {
+  const body = String(bodyText || '');
+  let head = body.slice(0, 300);
+  let quota = '';
+  try {
+    const err = (JSON.parse(body) || {}).error || {};
+    if (err.message || err.status) {
+      head = `${String(err.message || '').slice(0, 300)} [status=${err.status || ''}]`;
+    }
+    const ids = [];
+    (err.details || []).forEach(function (d) {
+      (d && d.violations || []).forEach(function (v) { if (v && v.quotaId) ids.push(v.quotaId); });
+    });
+    if (ids.length) quota = ` [quota=${ids.join(',')}]`;
+  } catch (_) {}
+  return new Error(`Gemini API (${code}): ${head}${quota}`);
+}
+
+/** STEP1·2 큐를 치명적 오류로 정지 — 실패 행부터 이어하기 가능하게 V_CURRENT/V_END 보존 */
+function iv_haltVerifyQueue_(row, label) {
+  deleteVerifyTriggers_();
+  const props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    [VCONFIG.PROP.CURRENT]: String(row),     // 실패한 행부터 재개 (그 행의 error 는 재검증 시 덮어씀)
+    [VCONFIG.PROP.RUNNING]: 'false',
+    [VCONFIG.PROP.STOP]:    'false',
+    [VCONFIG.PROP.HALTED]:  'true',
+  });
+  SpreadsheetApp.flush();
+  Logger.log(`[HALT] 문항 검증 정지: 행 ${row} — ${label}`);
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      `⛔ ${label}\n행 ${row}에서 멈췄습니다. 한도 조정 후 이어하기 하세요.`, '문항 검증 중단', 30);
+  } catch (_) {}
+}
+
+/** 멈춘 STEP1·2 큐 재기동 (V_CURRENT 부터) */
+function iv_resumeHaltedQueue_() {
+  iv_clearFatal_();
+  const props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    [VCONFIG.PROP.RUNNING]:   'true',
+    [VCONFIG.PROP.STOP]:      'false',
+    [VCONFIG.PROP.HEARTBEAT]: String(Date.now()),
+  });
+  props.deleteProperty(VCONFIG.PROP.HALTED);
+  scheduleNextBatch_();
+}
+
+/**
+ * 메뉴 진입 시: 한도 초과로 멈춘 작업이 있으면 이어하기 제안
+ * @return {'continue'|'resumed'|'cancel'}
+ */
+function iv_offerHaltedResume_(ui) {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(VCONFIG.PROP.HALTED) !== 'true') return 'continue';
+
+  const cur = parseInt(props.getProperty(VCONFIG.PROP.CURRENT), 10);
+  const end = parseInt(props.getProperty(VCONFIG.PROP.END), 10);
+  if (!cur || !end || cur > end) {
+    props.deleteProperty(VCONFIG.PROP.HALTED);
+    return 'continue';
+  }
+
+  const pv = (typeof pv_loadState_ === 'function') ? pv_loadState_() : null;
+  const fromPipeline = !!(pv && pv.stage === 'stopped' && pv.fatal);
+
+  const choice = ui.alert(
+    '⛔ API 한도 초과로 멈춘 작업',
+    `사유: ${iv_getFatal_() || '(기록 없음)'}\n` +
+    `멈춘 위치: 행 ${cur} / 종료 행 ${end}\n\n` +
+    (fromPipeline
+      ? `※ 원클릭 파이프라인에서 멈춘 작업입니다. [⚡ 원클릭 파이프라인 > ⏯ 이어하기]로 재개하는 것을 권장합니다.\n\n`
+      : '') +
+    `→ YES: 한도를 조정했으면 행 ${cur}부터 이어서 검증\n` +
+    `→ NO: 멈춘 작업을 버리고 새 범위 입력\n` +
+    `→ CANCEL: 닫기`,
+    ui.ButtonSet.YES_NO_CANCEL
+  );
+
+  if (choice === ui.Button.YES) {
+    iv_resumeHaltedQueue_();
+    ui.alert(`행 ${cur}부터 약 ${VCONFIG.BATCH_INTERVAL_MS / 1000}초 뒤 검증을 재개합니다.`);
+    return 'resumed';
+  }
+  if (choice === ui.Button.NO) {
+    finishVerification_('한도 초과로 멈춘 작업을 정리했습니다.');
+    iv_clearFatal_();
+    return 'continue';
+  }
+  return 'cancel';
+}
+
+/**
+ * v5 → 패치 14: 재시도 가능 여부 판별
+ * - 치명적 오류(월 지출 한도·일일 한도·크레딧)는 iv_markFatal_ 로 기록 후 영구 에러
+ * - 503, 429(분당 한도 등), 500, 502, 504 → 재시도 가능
+ * - 400, 401, 403, 404 → 영구 실패
  */
 function is503Error_(errorMsg) {
-  // v5: spending cap 초과는 재시도 무의미 → 즉시 영구 에러 처리
-  if (errorMsg.includes('spending cap') || errorMsg.includes('RESOURCE_EXHAUSTED')) {
-    Logger.log('[FATAL] 월간 지출 한도 초과. 재시도 불가. https://ai.studio/spend 에서 한도 확인.');
-    return false;
-  }
+  errorMsg = String(errorMsg || '');
+
+  // 패치 14: 치명적 한도 → 기록 후 재시도 안 함 (호출자가 작업을 멈춤)
+  if (iv_markFatal_(errorMsg)) return false;
 
   // 명시적 재시도 가능 코드
   const retryableCodes = ['503', '429', '500', '502', '504'];
@@ -812,6 +1019,8 @@ function is503Error_(errorMsg) {
   }
   // "high demand", "UNAVAILABLE" 등의 키워드도 재시도 대상
   if (errorMsg.includes('UNAVAILABLE') || errorMsg.includes('high demand')) return true;
+  // 패치 14: 치명적으로 분류되지 않은 RESOURCE_EXHAUSTED (분당 한도) → 재시도
+  if (errorMsg.includes('RESOURCE_EXHAUSTED')) return true;
   // content 없음 (간헐적 빈 응답)도 재시도
   if (errorMsg.includes('content를 찾을 수 없습니다')) return true;
   return false;
@@ -861,7 +1070,7 @@ function callGeminiUnified_(sys, usr, ast, imgParts) {   // 패치 12: imgParts(
 
   const code = resp.getResponseCode();
   if (code !== 200) {
-    throw new Error(`Gemini API (${code}): ${resp.getContentText().slice(0, 300)}`);
+    throw iv_geminiHttpError_(code, resp.getContentText());   // 패치 14: quotaId 포함
   }
 
   const json    = JSON.parse(resp.getContentText());
@@ -1114,6 +1323,7 @@ function finishVerification_(message) {
   props.deleteProperty(VCONFIG.PROP.START);
   props.deleteProperty(VCONFIG.PROP.BATCH);
   props.deleteProperty(VCONFIG.PROP.HEARTBEAT);  // v3: heartbeat도 정리
+  props.deleteProperty(VCONFIG.PROP.HALTED);     // 패치 14
   props.setProperty(VCONFIG.PROP.STOP, 'false');
   props.setProperty(VCONFIG.PROP.RUNNING, 'false');
 
@@ -1348,6 +1558,8 @@ function retryErrorRows() {
     return;
   }
 
+  iv_clearFatal_();   // 패치 14: 새 작업 시작
+
   const startTime = Date.now();
   let processed = 0;
   let errors    = 0;
@@ -1437,7 +1649,7 @@ function retryErrorRows() {
       }
 
       // ── v6: STEP 3 재검증 (U열 error/timeout — QualityVerification.gs 재사용) ──
-      if (t.retryQuality) {
+      if (t.retryQuality && !iv_getFatal_()) {
         if (t.retryProblem || t.retrySolution) {
           Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
         }
@@ -1448,7 +1660,7 @@ function retryErrorRows() {
       }
 
       // ── v5(STEP4): 군더더기 재검증 (Z열 error/timeout — verifyGarbageForRow_ 재사용, U/V/W/X 무접촉) ──
-      if (t.retryGarbage) {
+      if (t.retryGarbage && !iv_getFatal_()) {   // 패치 14: STEP3에서 치명적 오류면 건너뜀
         if (t.retryProblem || t.retrySolution || t.retryQuality) {
           Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
         }
@@ -1464,6 +1676,20 @@ function retryErrorRows() {
       Logger.log(`retryErrorRows row ${t.row} error: ${e.message}`);
       errors++;
       // 실패해도 N/Q열은 그대로 두어 다음 재시도 시 다시 잡히게 함
+    }
+
+    // ── 패치 14: 치명적 API 오류 → 즉시 중단 (남은 행은 error 그대로 → 같은 범위 재실행 시 다시 잡힘) ──
+    const fatal = iv_getFatal_();
+    if (fatal) {
+      SpreadsheetApp.flush();
+      ui.alert(
+        `⛔ API 한도 초과로 재검증을 중단했습니다.\n\n` +
+        `사유: ${fatal}\n` +
+        `멈춘 행: ${t.row}\n` +
+        `처리: ${processed} / ${targets.length} (실패 ${errors})\n\n` +
+        `한도를 조정한 뒤 이 메뉴를 같은 범위로 다시 실행하면 남은 error 행만 처리됩니다.`
+      );
+      return;
     }
 
     // ── v4: 행 간 쿨다운 ──

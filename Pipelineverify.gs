@@ -1,5 +1,13 @@
 /*************************************************
- * PipelineVerify.gs — 원클릭 검증 파이프라인  v1.1 (2026-09-14)
+ * PipelineVerify.gs — 원클릭 검증 파이프라인  v1.2 (2026-09-17)
+ *
+ *  v1.2 패치(패치 14): 치명적 API 오류(Gemini 월 지출 한도·일일 한도 / Claude 크레딧) 시 즉시 멈춤
+ *   - verify 폴링: 큐가 멈췄는데 API_FATAL/V_HALTED 가 있으면 완료로 오인하지 않고 정지
+ *   - retry·quality: 행 처리 후 iv_getFatal_() 이면 정지 (quality 는 cursor 보존)
+ *   - 정지 상태는 'stopped' + stoppedFrom + st.fatal → [⏯ 이어하기]로 중단 지점부터 재개
+ *     (verify 단계에서 멈췄으면 이어하기가 문항 검증 큐를 V_CURRENT 부터 재기동)
+ *   - pv_start / pv_resume 에서 API_FATAL 해제
+ *   - 의존 추가: iv_getFatal_, iv_clearFatal_, iv_resumeHaltedQueue_ (Itemverification.gs 패치 14)
  *
  *  v1.1 패치: 키워드·A열 key 비교를 유니코드 NFC 정규화 후 수행
  *   - macOS/Drive 파일명에서 복사한 한글은 NFD(자모 분리) 형태라
@@ -165,6 +173,8 @@ function pv_start() {
     load: null, verify: null, retry: null, quality: null, stack: null, stats: null, error: ''
   };
   props.setProperty(PV.STOP_PROP, 'false');
+  iv_clearFatal_();                                   // v1.2: 이전 치명적 오류 표시 해제
+  props.deleteProperty(VCONFIG.PROP.HALTED);          // v1.2
   pv_saveState_(st);
   pv_log_(st, 'start', `키워드: ${keywords.join(' | ')}`);
   pv_createWatchdog_();
@@ -201,10 +211,23 @@ function pv_resume() {
     st.stage = st.stoppedFrom || 'load';
     delete st.stoppedFrom;
   }
+  const wasFatal = st.fatal ? st.fatal.label : '';
+  delete st.fatal;
+  iv_clearFatal_();                                   // v1.2: 한도 조정 후 재개 전제
   props.setProperty(PV.STOP_PROP, 'false');
   props.setProperty(VCONFIG.PROP.STOP, 'false');
+
+  // v1.2: 문항 검증 큐가 치명적 오류로 멈춘 상태면 V_CURRENT 부터 재기동 (폴링은 기존대로)
+  let queueNote = '';
+  if (st.stage === 'verify' && st.verify &&
+      props.getProperty(VCONFIG.PROP.HALTED) === 'true' &&
+      props.getProperty(VCONFIG.PROP.RUNNING) !== 'true') {
+    iv_resumeHaltedQueue_();
+    queueNote = ` / 문항 검증 큐 재기동: 행 ${props.getProperty(VCONFIG.PROP.CURRENT)}부터`;
+  }
+
   pv_saveState_(st);
-  pv_log_(st, st.stage, '수동 이어하기 (pv_resume)');
+  pv_log_(st, st.stage, '수동 이어하기 (pv_resume)' + (wasFatal ? ` — 직전 중단 사유: ${wasFatal}` : '') + queueNote);
   pv_createWatchdog_();
   pv_tick();
 }
@@ -244,14 +267,14 @@ function pv_tick() {
     while (Date.now() < deadline) {
       const r = pv_runStage_(st, deadline);         // st.stage 를 진행시킴
       pv_saveState_(st);
-      if (['done', 'error'].includes(st.stage)) break;
+      if (['done', 'error', 'stopped'].includes(st.stage)) break;   // v1.2: 'stopped'(치명적 오류 정지) 포함
       if (props.getProperty(PV.STOP_PROP) === 'true') { needResume = false; break; }
       if (r === 'yield') { needResume = true; delayMs = PV.RESUME_AFTER_MS; break; }
       if (r === 'poll')  { needResume = true; delayMs = PV.POLL_AFTER_MS;   break; }
       // r === 'next' → 같은 실행에서 다음 단계 계속
     }
 
-    if (!['done', 'error'].includes(st.stage) &&
+    if (!['done', 'error', 'stopped'].includes(st.stage) &&   // v1.2: 정지 상태면 이어하기 예약 안 함
         props.getProperty(PV.STOP_PROP) !== 'true' &&
         (needResume || Date.now() >= deadline)) {
       if (st.resumes >= PV.MAX_RESUMES) throw new Error(`이어하기 횟수 초과 (${PV.MAX_RESUMES})`);
@@ -274,7 +297,7 @@ function pv_tick() {
   if (st && ['done', 'error'].includes(st.stage)) pv_finish_(st);
 }
 
-/** 한 단계 실행. 'next' | 'yield'(시간 부족, 같은 단계 재개) | 'poll'(완료 대기) 반환 */
+/** 한 단계 실행. 'next' | 'yield'(시간 부족, 같은 단계 재개) | 'poll'(완료 대기) | 'halt'(v1.2: 치명적 API 오류 정지) 반환 */
 function pv_runStage_(st, deadline) {
   const ss = SpreadsheetApp.getActive();
   const props = PropertiesService.getScriptProperties();
@@ -303,6 +326,7 @@ function pv_runStage_(st, deadline) {
           throw new Error('문항 검증이 이미 실행 중입니다. (수동 실행과 충돌)');
         }
         deleteVerifyTriggers_();
+        props.deleteProperty(VCONFIG.PROP.HALTED);   // v1.2
         props.setProperties({
           [VCONFIG.PROP.CURRENT]:   '2',
           [VCONFIG.PROP.START]:     '2',
@@ -320,6 +344,16 @@ function pv_runStage_(st, deadline) {
 
       // ── 폴링 ──
       st.verify.polls++;
+
+      // v1.2: 큐가 치명적 API 오류로 멈춘 경우 — 완료로 오인해 retry 로 넘어가지 않도록 먼저 검사
+      if (props.getProperty(VCONFIG.PROP.RUNNING) !== 'true') {
+        const vFatal = iv_getFatal_();
+        if (vFatal || props.getProperty(VCONFIG.PROP.HALTED) === 'true') {
+          return pv_haltFatal_(st, vFatal || '치명적 API 오류',
+            `문항 검증(STEP1·2) 행 ${props.getProperty(VCONFIG.PROP.CURRENT)}`);
+        }
+      }
+
       if (props.getProperty(VCONFIG.PROP.RUNNING) !== 'true') {
         pv_log_(st, 'verify', `문항 검증 완료 (폴링 ${st.verify.polls}회, 정체 복구 ${st.verify.recovered}회)`);
         st.stage = 'retry';
@@ -386,6 +420,8 @@ function pv_runStage_(st, deadline) {
         }
         pv_retryRow_(sheet, t, pPr, sPr, deadline);
         done++;
+        const rFatal = iv_getFatal_();   // v1.2
+        if (rFatal) return pv_haltFatal_(st, rFatal, `오류 행 재검증 라운드 ${st.retry.round} 행 ${t.row}`);
         Utilities.sleep(VCONFIG.INTER_ROW_COOLDOWN_MS);
       }
       SpreadsheetApp.flush();
@@ -414,6 +450,8 @@ function pv_runStage_(st, deadline) {
           return 'yield';
         }
         verifyQualityForRow_(sheet, row, qPrompts, remaining);
+        const qFatal = iv_getFatal_();   // v1.2: U='error' 로 남은 이 행부터 재개
+        if (qFatal) { st.quality.cursor = row; return pv_haltFatal_(st, qFatal, `논리 검증(STEP3) 패스 ${st.quality.pass} 행 ${row}`); }
         Utilities.sleep(QCONFIG.INTER_ROW_COOLDOWN_MS);
       }
       SpreadsheetApp.flush();
@@ -626,6 +664,25 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
   }
 }
 
+/**
+ * v1.2: 치명적 API 오류로 파이프라인 정지.
+ * 'stopped' + stoppedFrom 으로 두어 [⏯ 이어하기]가 중단 단계부터 재개하게 한다.
+ * (watchdog 은 stopped 상태에서 스스로 삭제되므로 자동 재기동이 반복되지 않음)
+ * @return {'halt'}
+ */
+function pv_haltFatal_(st, label, where) {
+  st.stoppedFrom = st.stage;
+  st.stage = 'stopped';
+  st.fatal = { label: label, where: where, at: new Date().toISOString() };
+  pv_saveState_(st);
+  pv_log_(st, 'stopped', `⛔ ${label} — ${where}에서 멈춤. 한도를 조정한 뒤 [⏯ 이어하기]로 재개하세요.`);
+  pv_clearAllTriggers_();
+  try {
+    SpreadsheetApp.getActive().toast(`⛔ ${label}\n${where}에서 멈춤 → 한도 조정 후 ⏯ 이어하기`, '원클릭 파이프라인', 30);
+  } catch (_) {}
+  return 'halt';
+}
+
 /* =================================================
  * watchdog — 1시간 간격, 파이프라인 활성 중에만 존재
  * (예약 트리거 유실·일일 쿼터 소진 정체 시 자동 재기동)
@@ -714,6 +771,7 @@ function pv_summary_(st) {
     (st.stack.emptyN && st.stack.emptyN.length ? `, 미검증 ${st.stack.emptyN.length}행` : '') +
     (st.stack.keyParseFail && st.stack.keyParseFail.length ? `, key 분해 실패 ${st.stack.keyParseFail.length}건` : ''));
   if (st.stats) lines.push(`통계: 구간 ${st.stats.runs}, 세트 ${st.stats.sets}, 제외 ${st.stats.skipped}`);
+  if (st.fatal) lines.push(`⛔ API 한도 초과로 정지: ${st.fatal.label} (${st.fatal.where}) → 한도 조정 후 ⏯ 이어하기`);   // v1.2
   if (st.error) lines.push(`오류: ${st.error}`);
   return lines.join('\n');
 }

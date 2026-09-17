@@ -43,7 +43,11 @@ function onOpen() {
     .addItem('ℹ️ 현재 모델 확인', 'showCurrentModel')
     .addSeparator()
     .addItem('📦 처리결과 Stack에 저장', 'moveResultsToStack')
-    .addItem('📦 Stack 세트열 이전(1회)', 'mts_migrateSetCols')   // v4: Y/Z → AD/AE 마이그레이션
+    // v4.1(Phase B): '📦 Stack 세트열 이전(1회)' 메뉴 제거.
+    //   1회성 마이그레이션은 이미 완료됐고, 지금 Stack 의 Z열은 garbage_verdict(STEP4 판정)다.
+    //   실수로 한 번 더 누르면 그 값이 문항그룹 자리로 덮어써지고 삭제된다(되돌릴 수 없음).
+    //   함수 mts_migrateSetCols 는 남아 있으므로 정말 필요하면 편집기에서 직접 실행할 것
+    //   (v4.1 부터는 필요 없는 상태면 함수 스스로 거부한다).
     .addItem('📊 난이도 통계 계산', 'calculateDifficultyStats')   // ← 이 줄 추가
     .addItem('🧮 수식 $ 감싸기 (소급)', 'lw_wrapExistingMenu')     // v3
     .addSeparator()

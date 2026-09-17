@@ -1,9 +1,20 @@
 /**
  * ============================================================
- * MoveToStack.gs — 처리결과를 Stack 시트에 저장  v4
+ * MoveToStack.gs — 처리결과를 Stack 시트에 저장  v4.1
  * ============================================================
  * Data_DS의 A~AC(29열) 데이터를 Stack 시트 하단에 이어붙이고,
  * Data_DS의 2행 이하를 비웁니다 (서식 유지).
+ *
+ * [v4.1 변경사항 — 2026-09-15, Phase B]
+ *  - emptyNRows 행 번호 보정: 빈 행을 걸러낸 뒤의 인덱스로 계산해
+ *    중간에 빈 행이 섞이면 로그의 행 번호가 실제와 어긋나던 문제를 수정.
+ *    원본 Data_DS 행 번호를 함께 추적하고, 이관 후에도 찾을 수 있도록
+ *    Stack 행 번호(emptyNStackRows)를 함께 반환한다
+ *    (이관이 끝나면 Data_DS 는 비워지므로 Stack 행 번호가 실제로 쓸모 있다).
+ *  - mts_migrateSetCols 안전장치: 이미 이전이 끝난 상태에서 재실행하면
+ *    Stack Z열(= v5 garbage_verdict)을 문항그룹으로 덮어쓰고 지운다.
+ *    실행 전에 mts_needsMigration_ 으로 필요 여부를 확인하고, 불필요하면 거부한다.
+ *    메뉴 항목은 MainMenu 에서 제거됨 — 필요 시 편집기에서만 호출.
  *
  * [v4 변경사항 — 2026-09-03, 체크리스트 ④·패치 13]
  *  - 세트명·문항그룹 열 이전: Y(25)/Z(26) → AD(30)/AE(31).
@@ -129,7 +140,8 @@ function mts_core_() {
   const srcSheet = ss.getSheetByName(MTS.SRC_SHEET);
   const dstSheet = ss.getSheetByName(MTS.DST_SHEET);
 
-  const fail = (msg) => ({ ok: false, message: msg, rows: 0, appendRow: 0, endRow: 0, emptyNRows: [], keyParseFail: [] });
+  const fail = (msg) => ({ ok: false, message: msg, rows: 0, appendRow: 0, endRow: 0,
+                           emptyNRows: [], emptyNStackRows: [], keyParseFail: [] });
 
   if (!srcSheet) return fail('Data_DS 시트를 찾을 수 없습니다.');
   if (!dstSheet) return fail('Stack 시트를 찾을 수 없습니다.');
@@ -153,15 +165,13 @@ function mts_core_() {
   const numRows = srcLastRow - 1;
   const srcData = srcSheet.getRange(2, 1, numRows, MTS.NUM_COLS).getValues();
 
-  // 완전히 빈 행 제거
-  const validData = srcData.filter(row => row.some(cell => String(cell).trim() !== ''));
-  if (validData.length === 0) return fail('Data_DS에 유효한 데이터가 없습니다.');
-
-  // N열 빈 행 기록 (경고용 — 저장은 진행, D2 결정)
-  const emptyNRows = [];
-  for (let i = 0; i < validData.length; i++) {
-    if (String(validData[i][MTS.COL_N_IDX] || '').trim() === '') emptyNRows.push(i + 2);
+  // 완전히 빈 행 제거 — v4.1: 원본 Data_DS 행 번호를 함께 보존한다
+  const valid = [];
+  for (let i = 0; i < srcData.length; i++) {
+    if (srcData[i].some(cell => String(cell).trim() !== '')) valid.push({ srcRow: i + 2, data: srcData[i] });
   }
+  if (valid.length === 0) return fail('Data_DS에 유효한 데이터가 없습니다.');
+  const validData = valid.map(v => v.data);
 
   // ── Stack 헤더 보장 (Y=fig_info, AD/AE=세트명/문항그룹) ──
   mts_ensureHeaders_(dstSheet);
@@ -170,6 +180,17 @@ function mts_core_() {
   const dstLastRow = dstSheet.getLastRow();
   const appendRow  = (dstLastRow >= 1) ? dstLastRow + 1 : 2;
   dstSheet.getRange(appendRow, 1, validData.length, MTS.NUM_COLS).setValues(validData);
+
+  // ── N열 빈 행 기록 (경고용 — 저장은 진행, D2 결정) ──
+  // v4.1: 원본 Data_DS 행 번호(emptyNRows)와 이관된 Stack 행 번호(emptyNStackRows)를 함께 남긴다
+  const emptyNRows = [];
+  const emptyNStackRows = [];
+  for (let i = 0; i < valid.length; i++) {
+    if (String(valid[i].data[MTS.COL_N_IDX] || '').trim() === '') {
+      emptyNRows.push(valid[i].srcRow);
+      emptyNStackRows.push(appendRow + i);
+    }
+  }
 
   // ── AD/AE 자동 기입: A열 key를 마지막 '_' 기준 분해 ──
   const yz = [];
@@ -203,7 +224,8 @@ function mts_core_() {
     rows: validData.length,
     appendRow: appendRow,
     endRow: endRow,
-    emptyNRows: emptyNRows,
+    emptyNRows: emptyNRows,             // Data_DS 원본 행 번호 (v4.1: 보정됨)
+    emptyNStackRows: emptyNStackRows,   // v4.1: 이관 후 Stack 행 번호 (이관 뒤에 실제로 찾을 수 있는 쪽)
     keyParseFail: keyParseFail,
   };
 }
@@ -242,6 +264,23 @@ function mts_migrateSetCols() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const dstSheet = ss.getSheetByName(MTS.DST_SHEET);
   if (!dstSheet) { ui.alert('Stack 시트를 찾을 수 없습니다.'); return; }
+
+  // ── v4.1 안전장치 ──
+  // 이전이 이미 끝난 Stack 에서 다시 돌리면 Y=fig_info → AD(세트명),
+  // Z=garbage_verdict → AE(문항그룹) 으로 덮어쓰고 Y·Z 를 지운다. 되돌릴 수 없다.
+  if (!mts_needsMigration_(dstSheet)) {
+    ui.alert('이전이 이미 완료되었습니다',
+      'Stack Y/Z열에 옮길 구(舊) 세트명 데이터가 없습니다.\n\n' +
+      '현재 Y열은 fig_info, Z열은 garbage_verdict(STEP4 판정)입니다.\n' +
+      '지금 실행하면 그 값들이 세트명·문항그룹 자리로 덮어써지고 삭제되므로 중단합니다.',
+      ui.ButtonSet.OK);
+    return;
+  }
+  const goMig = ui.alert('Stack 세트열 이전 (1회성)',
+    '구 Y/Z열의 세트명·문항그룹을 AD/AE로 옮기고 Y/Z를 비웁니다.\n' +
+    '이 작업은 되돌릴 수 없습니다. 계속할까요?',
+    ui.ButtonSet.YES_NO);
+  if (goMig !== ui.Button.YES) return;
 
   if (dstSheet.getMaxColumns() < MTS.COL_GROUP) {
     dstSheet.insertColumnsAfter(dstSheet.getMaxColumns(), MTS.COL_GROUP - dstSheet.getMaxColumns());

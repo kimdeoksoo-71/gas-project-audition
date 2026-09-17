@@ -2,6 +2,13 @@
  * ============================================================
  * QualityVerification.gs — STEP 3: 해설 논리 검증 + STEP 4: 해설 군더더기 검출 (v5)
  * ============================================================
+ * 패치 14 (2026-09-17): 치명적 API 오류 시 즉시 멈춤 (Itemverification.gs 패치 14 필요)
+ *   - Gemini HTTP 오류는 iv_geminiHttpError_ 로 quotaId 포함 → 일일/분당 한도 구분
+ *   - Claude 크레딧/결제 오류는 iv_markFatal_ 로 기록 (종전: 재시도만 안 하고 다음 행 계속)
+ *   - startQualityVerification: 행 처리 후 iv_getFatal_() 이면 루프 중단 + 사유 안내
+ *   - 실행기: qr_start 에서 표시 해제, qr_processRow 는 치명적 오류 행을 error+사유로 반환하고
+ *     다음 호출에서 'stopped' 반환 → 사이드바가 멈춤
+ * ============================================================
  * v5 변경사항 (2026-09-10, STEP4 군더더기 검출 — "논리 분리 · 운영 통합"):
  *   - STEP4 신설: 결론에 영향을 주지 않아도 없어야 할 서술(군더더기) 3유형을 검출한다.
  *       irrelevant(무관) / redundant(중복) / loose_equivalence(느슨한 서술)
@@ -75,6 +82,7 @@
  *
  * 재사용(Itemverification.gs의 전역 함수, 수정 없음):
  *   getPromptSet, safeParseGeminiJson_, is503Error_, parseRowRange(MainMenu.gs)
+ *   (패치 14) iv_markFatal_, iv_getFatal_, iv_clearFatal_, iv_geminiHttpError_
  *
  * v3 (패치 12 확장): 그림 첨부
  *   - 본문(E·C열) 속 ![파일명](Drive링크) 그림을 내려받아 1차 Gemini 에는 inline_data,
@@ -229,6 +237,7 @@ function startQualityVerification() {
   if (confirm !== ui.Button.YES) return;
 
   // ── 실행 상태 설정 ──
+  iv_clearFatal_();   // 패치 14: 새 작업 시작
   props.setProperties({
     [QCONFIG.PROP.STOP]:      'false',
     [QCONFIG.PROP.RUNNING]:   'true',
@@ -239,7 +248,7 @@ function startQualityVerification() {
   const startTime = Date.now();
   const stats = { ok: 0, fail: 0, check: 0, skip: 0, error: 0 };
   let lastDoneRow = 0;
-  let stoppedBy = '';   // '' | 'time' | 'user'
+  let stoppedBy = '';   // '' | 'time' | 'user' | 'fatal'(패치 14)
 
   try {
     for (let k = 0; k < targets.length; k++) {
@@ -257,6 +266,9 @@ function startQualityVerification() {
       const status = verifyQualityForRow_(sheet, row, qPrompts, remaining);
       if (stats[status] !== undefined) stats[status]++;
       lastDoneRow = row;
+
+      // 패치 14: 치명적 API 오류 → 남은 행 호출 중단
+      if (iv_getFatal_()) { stoppedBy = 'fatal'; break; }
 
       if (k < targets.length - 1) Utilities.sleep(QCONFIG.INTER_ROW_COOLDOWN_MS);
       if (k % 3 === 0) SpreadsheetApp.flush();
@@ -276,7 +288,12 @@ function startQualityVerification() {
     `· error(호출 실패): ${stats.error}\n` +
     `마지막 처리 행: ${lastDoneRow || '없음'}`;
 
-  if (stoppedBy === 'time') {
+  if (stoppedBy === 'fatal') {
+    ui.alert('⛔ 논리 검증 — API 한도 초과로 중단',
+      `사유: ${iv_getFatal_()}\n\n` + summary +
+      '\n\n한도를 조정한 뒤 같은 범위로 메뉴를 재실행하면 남은 행(빈칸·error)부터 이어서 처리됩니다.',
+      ui.ButtonSet.OK);
+  } else if (stoppedBy === 'time') {
     ui.alert('논리 검증 — 시간 한도 근접으로 중단',
       summary + '\n\n같은 범위로 메뉴를 재실행하면 남은 행부터 이어서 처리됩니다.',
       ui.ButtonSet.OK);
@@ -852,7 +869,7 @@ function callGeminiForQualityOnce_(sys, usr, ast, imgParts) {   // 패치 12: im
   });
 
   const code = resp.getResponseCode();
-  if (code !== 200) throw new Error(`Gemini API (${code}): ${resp.getContentText().slice(0, 300)}`);
+  if (code !== 200) throw iv_geminiHttpError_(code, resp.getContentText());   // 패치 14: quotaId 포함
 
   const json    = JSON.parse(resp.getContentText());
   const content = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
@@ -920,11 +937,8 @@ function callClaudeWithRetry_(sys, usr, timeBudgetMs, imgBlocks) {   // 패치 1
 function isClaudeRetryable_(errorMsg) {
   const msg = String(errorMsg);
 
-  // 크레딧/결제 계열 → 재시도 무의미
-  if (/credit balance|billing|purchase credits/i.test(msg)) {
-    Logger.log('[FATAL] Anthropic 크레딧/결제 문제. 재시도 불가. https://console.anthropic.com 확인.');
-    return false;
-  }
+  // 크레딧/결제 계열 → 재시도 무의미. 패치 14: 치명적 오류로 기록 → 호출자가 작업을 멈춤
+  if (iv_markFatal_(msg)) return false;
 
   const retryableCodes = ['529', '429', '500', '502', '503', '504'];
   for (const code of retryableCodes) {
@@ -1157,6 +1171,7 @@ function qr_start(rangeText, mode) {
     else skippedDone++;
   }
 
+  iv_clearFatal_();   // 패치 14: 새 작업 시작
   props.setProperties({
     [QCONFIG.PROP.STOP]:      'false',
     [QCONFIG.PROP.RUNNING]:   'true',
@@ -1190,6 +1205,12 @@ function qr_processRow(row, step, isFirst) {
     return { row: row, step: st.step, status: 'stopped' };
   }
 
+  // 패치 14: 앞선 작업에서 치명적 API 오류가 났으면 호출하지 않고 멈춤
+  const fatalBefore = iv_getFatal_();
+  if (fatalBefore) {
+    return { row: row, step: st.step, status: 'stopped', message: fatalBefore };
+  }
+
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(QCONFIG.DATA_SHEET);
   if (!sheet) return { row: row, step: st.step, status: 'error', message: 'Data_DS 시트를 찾을 수 없습니다.' };
 
@@ -1203,6 +1224,12 @@ function qr_processRow(row, step, isFirst) {
 
   const status = st.verifyRow(sheet, row, prompts, QCONFIG.RUNNER_ROW_BUDGET_MS);
   SpreadsheetApp.flush();
+
+  // 패치 14: 이 작업에서 치명적 오류 → 사유를 로그에 남기고, 다음 호출이 'stopped' 로 멈춘다
+  const fatalNow = iv_getFatal_();
+  if (fatalNow) {
+    return { row: row, step: st.step, status: status, message: '⛔ ' + fatalNow + ' — 다음 작업부터 중단' };
+  }
 
   return { row: row, step: st.step, status: status };
 }

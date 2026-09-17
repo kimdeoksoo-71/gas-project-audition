@@ -86,7 +86,8 @@
           3) 수식 신호(연산자·^/_·\명령·함수호출) 있는 런만 감쌈
           4) 개행은 런에 미포함($…$ 안에 <br>이 끼지 않도록)
          ───────────────────────────────────────────── */
-      var MATH_WRAP_COLS = { 15:1, 16:1, 18:1, 22:1, 23:1 }; // O,P,R,V,W (E·C 제외)
+      // v5.1(Phase C): AA(27)·AB(28) = STEP4 군더더기 리포트/감사 추가
+      var MATH_WRAP_COLS = { 15:1, 16:1, 18:1, 22:1, 23:1, 27:1, 28:1 }; // O,P,R,V,W,AA,AB (E·C 제외)
 
       function wrapBareMathDelimiters(text) {
         if (text === null || text === undefined) return '';
