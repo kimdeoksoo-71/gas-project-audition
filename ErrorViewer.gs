@@ -1,4 +1,12 @@
-function doGet() {
+/**
+ * 오류 뷰어 HTML.
+ * ⚠️ 원래 이름은 `doGet`이었으나 `RemoteApi.gs`가 웹앱 라우터를 맡으면서 이름을 옮겼다.
+ *    GAS는 프로젝트당 `doGet`이 하나뿐이다. 뷰어 웹앱은 배포된 적이 없어(2026-09-19 확인)
+ *    지금은 호출하는 곳이 없다. 메뉴의 오류 뷰어는 아래 `openErrorViewer()`(팝업)를 쓴다.
+ *    웹앱으로 다시 열고 싶다면 RemoteApi에 토큰 검증 뒤의 `cmd=viewer`로 붙일 것 —
+ *    "모든 사용자" 배포에서 토큰 없이 열리게 하면 검증 데이터가 공개된다.
+ */
+function ev_render_() {
   return HtmlService.createHtmlOutputFromFile('Index')
     .setTitle('Math Problem Error Viewer') // 웹 앱 타이틀
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);

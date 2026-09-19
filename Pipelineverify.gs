@@ -75,7 +75,6 @@ const PV = {
 function pv_start() {
   const ui = SpreadsheetApp.getUi();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const props = PropertiesService.getScriptProperties();
 
   // ── 0. 동시 실행 방지 ──
   const cur = pv_loadState_();
@@ -84,37 +83,12 @@ function pv_start() {
       `현재 단계: ${cur.stage}\n키워드: ${(cur.keywords || []).join(', ')}\n\n중단하고 새로 시작할까요?`,
       ui.ButtonSet.YES_NO);
     if (r !== ui.Button.YES) return;
-    pv_clearAllTriggers_();
-    props.setProperty(PV.STOP_PROP, 'false');
   }
-  if (props.getProperty(VCONFIG.PROP.RUNNING) === 'true') {
-    ui.alert('문항 검증이 이미 실행 중입니다.\n완료 후 시작하거나, [검토 > 작업 중단] 후 다시 시도하세요.');
-    return;
-  }
-  if (props.getProperty('Q_RUNNING') === 'true') {
-    ui.alert('논리 검증이 이미 실행 중입니다. 완료 후 다시 시도하세요.');
-    return;
-  }
+  const busy = pv_busyReason_();
+  if (busy) { ui.alert(busy); return; }
 
   // ── 1. 사전 점검 일괄 ──
-  const problems = [];
-  if (!props.getProperty('GEMINI_API_KEY')) problems.push('GEMINI_API_KEY 미설정');
-  if (!props.getProperty('CLAUDE_API_KEY')) problems.push('CLAUDE_API_KEY 미설정');
-  const pP = getPromptSet('gemini_problem_verify');
-  const sP = getPromptSet('gemini_solution_verify');
-  if (!pP.system || !pP.user) problems.push('pmt: gemini_problem_verify (system/user) 누락');
-  if (!sP.system || !sP.user) problems.push('pmt: gemini_solution_verify (system/user) 누락');
-  if (!loadQualityPrompts_())  problems.push('pmt: gemini_quality_verify / claude_quality_judge (system/user) 누락');
-  if (!ss.getSheetByName('Stack')) problems.push('Stack 시트 없음');
-  if (!ss.getSheetByName('Stat'))  problems.push('Stat 시트 없음');
-  let latexOk = false;
-  try {
-    const t = SpreadsheetApp.openById(pv_latexFileId_());
-    latexOk = !!t.getSheetByName(PV.LATEX_SRC_SHEET);
-    if (!latexOk) problems.push('Latex변환 파일에 Data_DS 시트 없음');
-  } catch (e) {
-    problems.push('Latex변환 파일 열기 실패 (권한/ID 확인): ' + e.message);
-  }
+  const problems = pv_preflight_({ quality: true });
   if (problems.length) {
     ui.alert('사전 점검 실패', '다음 문제를 해결한 뒤 다시 실행하세요:\n\n· ' + problems.join('\n· '), ui.ButtonSet.OK);
     return;
@@ -126,39 +100,26 @@ function pv_start() {
     '여러 개면 쉼표(,) 또는 줄바꿈으로 구분 (OR 조건, 부분 일치)\n예: S팀모의6회, S팀모의7회',
     ui.ButtonSet.OK_CANCEL);
   if (res.getSelectedButton() !== ui.Button.OK) return;
-  const keywords = Array.from(new Set(
-    String(res.getResponseText() || '').split(/[,\n;]+/).map(s => pv_nfc_(s).trim()).filter(Boolean)
-  ));   // v1.1: NFC 정규화 (파일명 복사 시 NFD 한글 대응)
+  const keywords = pv_parseKeywords_(res.getResponseText());
   if (!keywords.length) { ui.alert('키워드가 비어 있습니다.'); return; }
 
   // ── 3. D1: 기존 Data_DS 데이터 보호 ──
-  const sheet = ss.getSheetByName(PV.DATA_SHEET);
-  const lastRow = sheet.getLastRow();
-  let preSavedRows = 0;
-  if (lastRow >= 2) {
-    const nVals = sheet.getRange(2, 14, lastRow - 1, 1).getValues();   // N열
-    const hasN = nVals.some(r => String(r[0] || '').trim() !== '');
-    if (hasN) {
-      const r = ui.alert(
-        '⚠️ 미저장 검증 결과 발견',
-        'Data_DS에 검증 결과(N열)가 남아 있습니다.\n파이프라인은 시작 시 Data_DS를 비우므로 이 결과가 사라집니다.\n\n' +
-        '예(YES): Stack에 먼저 저장한 뒤 진행 (권장)\n' +
-        '아니오(NO): 저장하지 않고 지우고 진행\n' +
-        '취소: 중단',
-        ui.ButtonSet.YES_NO_CANCEL);
-      if (r !== ui.Button.YES && r !== ui.Button.NO) return;
-      if (r === ui.Button.YES) {
-        const mres = mts_core_();
-        if (!mres.ok) { ui.alert('Stack 선(先)저장 실패: ' + mres.message); return; }
-        preSavedRows = mres.rows;
-      }
-    }
+  let preSave = 'save';
+  if (pv_hasUnsavedResults_(ss)) {
+    const r = ui.alert(
+      '⚠️ 미저장 검증 결과 발견',
+      'Data_DS에 검증 결과(N열)가 남아 있습니다.\n파이프라인은 시작 시 Data_DS를 비우므로 이 결과가 사라집니다.\n\n' +
+      '예(YES): Stack에 먼저 저장한 뒤 진행 (권장)\n' +
+      '아니오(NO): 저장하지 않고 지우고 진행\n' +
+      '취소: 중단',
+      ui.ButtonSet.YES_NO_CANCEL);
+    if (r !== ui.Button.YES && r !== ui.Button.NO) return;
+    preSave = (r === ui.Button.YES) ? 'save' : 'discard';
   }
 
-  // ── 4. 최종 확인 ──
+  // ── 4. 코어 실행 (최종 확인은 코어 호출 직전) ──
   const ok = ui.alert('확인',
     `키워드 ${keywords.length}개: ${keywords.join(' | ')}\n\n` +
-    (preSavedRows ? `(기존 결과 ${preSavedRows}행을 Stack에 먼저 저장했습니다)\n` : '') +
     `Data_DS(2행 이하)를 초기화한 뒤 아래를 자동 실행합니다:\n` +
     `검색·붙여넣기 → 문항 검증(STEP1·2) → error 재검증 → 논리 검증(STEP3)\n` +
     `→ Stack 저장(+세트명·문항그룹 자동 기입) → 난이도 통계\n\n` +
@@ -166,46 +127,181 @@ function pv_start() {
     ui.ButtonSet.YES_NO);
   if (ok !== ui.Button.YES) return;
 
-  // ── 5. 상태 초기화 & 시작 ──
+  const r = pv_startCore_(keywords, { quality: true, force: true, preSave: preSave, deferTick: false });
+  if (!r.ok) ui.alert('시작 실패', r.reason, ui.ButtonSet.OK);
+  else if (r.preSavedRows) ui.alert(`기존 결과 ${r.preSavedRows}행을 Stack에 먼저 저장했습니다.`);
+}
+
+/* =================================================
+ * 헤드리스 코어 (Phase 1) — UI를 절대 부르지 않는다
+ * ================================================= */
+
+/**
+ * 파이프라인 시작 코어. 메뉴(`pv_start`)와 원격 API(`RemoteApi.gs`)가 공유한다.
+ *
+ * @param {string[]} keywords  검색 키워드 (NFC 정규화된 상태여야 함)
+ * @param {Object}   opts
+ *   - `quality`  {boolean} STEP3(논리 검증) 실행. 기본 true (C8)
+ *   - `garbage`  {boolean} STEP4. **자리만 확보, 동작 없음** — 나중에 켤 때 API를 안 바꾸기 위함
+ *   - `force`    {boolean} 진행 중 파이프라인을 중단하고 새로 시작. 기본 false
+ *   - `preSave`  {'save'|'discard'} 미저장 결과 발견 시 처리. 기본 'save'
+ *   - `deferTick`{boolean} true면 첫 tick을 직접 돌리지 않고 1분 뒤 트리거로 예약.
+ *                헤드리스에서는 반드시 true — 웹앱 응답이 즉시 돌아가야 한다
+ * @return {{ok:boolean, reason?:string, runId?:string, stage?:string, preSavedRows?:number}}
+ */
+function pv_startCore_(keywords, opts) {
+  opts = opts || {};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+
+  keywords = (keywords || []).filter(Boolean);
+  if (!keywords.length) return { ok: false, reason: '키워드가 비어 있습니다.' };
+
+  // ── 0. 동시 실행 방지 ──
+  const cur = pv_loadState_();
+  if (cur && !['done', 'error', 'stopped'].includes(cur.stage)) {
+    if (!opts.force) {
+      return { ok: false, reason: `이미 실행 중입니다 (단계: ${cur.stage}, 키워드: ${(cur.keywords || []).join(', ')}). force=1로 중단 후 시작할 수 있습니다.` };
+    }
+    pv_clearAllTriggers_();
+    props.setProperty(PV.STOP_PROP, 'false');
+  }
+  const busy = pv_busyReason_();
+  if (busy) return { ok: false, reason: busy };
+
+  // ── 1. 사전 점검 ──
+  const wantQuality = opts.quality !== false;
+  const problems = pv_preflight_({ quality: wantQuality });
+  if (problems.length) return { ok: false, reason: '사전 점검 실패: ' + problems.join(' / ') };
+
+  // ── 2. 기존 결과 보호 ──
+  let preSavedRows = 0;
+  if (pv_hasUnsavedResults_(ss) && opts.preSave !== 'discard') {
+    const mres = mts_core_();
+    if (!mres.ok) return { ok: false, reason: 'Stack 선(先)저장 실패: ' + mres.message };
+    preSavedRows = mres.rows;
+  }
+
+  // ── 3. 상태 초기화 & 시작 ──
   const st = {
     stage: 'load', keywords: keywords, startedAt: new Date().toISOString(),
     resumes: 0, preSavedRows: preSavedRows,
+    opts: { quality: wantQuality, garbage: false },   // C8
     load: null, verify: null, retry: null, quality: null, stack: null, stats: null, error: ''
   };
   props.setProperty(PV.STOP_PROP, 'false');
   iv_clearFatal_();                                   // v1.2: 이전 치명적 오류 표시 해제
   props.deleteProperty(VCONFIG.PROP.HALTED);          // v1.2
   pv_saveState_(st);
-  pv_log_(st, 'start', `키워드: ${keywords.join(' | ')}`);
+  pv_log_(st, 'start', `키워드: ${keywords.join(' | ')}` + (wantQuality ? '' : ' (STEP3 건너뜀)'));
   pv_createWatchdog_();
-  pv_tick();
+
+  if (opts.deferTick) {
+    // 헤드리스: 웹앱 요청이 즉시 반환돼야 하므로 tick을 트리거로 넘긴다
+    ScriptApp.newTrigger(PV.TICK_FN).timeBased().after(60 * 1000).create();
+  } else {
+    pv_tick();
+  }
+  return { ok: true, runId: st.startedAt, stage: st.stage, preSavedRows: preSavedRows };
+}
+
+/** 다른 작업이 점유 중이면 사유 문자열, 아니면 빈 문자열 */
+function pv_busyReason_() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(VCONFIG.PROP.RUNNING) === 'true')
+    return '문항 검증이 이미 실행 중입니다. 완료 후 시작하거나, [검토 > 작업 중단] 후 다시 시도하세요.';
+  if (props.getProperty('Q_RUNNING') === 'true')
+    return '논리 검증이 이미 실행 중입니다. 완료 후 다시 시도하세요.';
+  return '';
+}
+
+/**
+ * 사전 점검. 문제 목록을 배열로 돌려준다(빈 배열 = 통과).
+ * ⚠️ STEP3 프롬프트는 `quality`가 켜진 경우에만 필수 — 헤드리스에서 `quality=0`이면
+ *    프롬프트가 없어도 진행돼야 한다 (C8).
+ */
+function pv_preflight_(opts) {
+  opts = opts || {};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  const problems = [];
+
+  if (!props.getProperty('GEMINI_API_KEY')) problems.push('GEMINI_API_KEY 미설정');
+  if (!props.getProperty('CLAUDE_API_KEY')) problems.push('CLAUDE_API_KEY 미설정');
+  const pP = getPromptSet('gemini_problem_verify');
+  const sP = getPromptSet('gemini_solution_verify');
+  if (!pP.system || !pP.user) problems.push('pmt: gemini_problem_verify (system/user) 누락');
+  if (!sP.system || !sP.user) problems.push('pmt: gemini_solution_verify (system/user) 누락');
+  if (opts.quality !== false && !loadQualityPrompts_())
+    problems.push('pmt: gemini_quality_verify / claude_quality_judge (system/user) 누락');
+  if (!ss.getSheetByName('Stack')) problems.push('Stack 시트 없음');
+  if (!ss.getSheetByName('Stat'))  problems.push('Stat 시트 없음');
+  try {
+    const t = SpreadsheetApp.openById(pv_latexFileId_());
+    if (!t.getSheetByName(PV.LATEX_SRC_SHEET)) problems.push('Latex변환 파일에 Data_DS 시트 없음');
+  } catch (e) {
+    problems.push('Latex변환 파일 열기 실패 (권한/ID 확인): ' + e.message);
+  }
+  return problems;
+}
+
+/** 키워드 문자열 파싱 — v1.1: NFC 정규화 (파일명 복사 시 NFD 한글 대응) */
+function pv_parseKeywords_(raw) {
+  return Array.from(new Set(
+    String(raw || '').split(/[,\n;]+/).map(s => pv_nfc_(s).trim()).filter(Boolean)
+  ));
+}
+
+/** Data_DS N열에 미저장 검증 결과가 남아 있는가 (D1) */
+function pv_hasUnsavedResults_(ss) {
+  const sheet = ss.getSheetByName(PV.DATA_SHEET);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return false;
+  const nVals = sheet.getRange(2, 14, lastRow - 1, 1).getValues();   // N열
+  return nVals.some(r => String(r[0] || '').trim() !== '');
 }
 
 /** 메뉴: 중지 — 현재 행/배치 마무리 후 멈춤 */
 function pv_stop() {
+  pv_stopCore_('사용자 중지');
+  try { SpreadsheetApp.getUi().alert('파이프라인을 중지했습니다.\n[⏯ 이어하기] 메뉴로 중단 지점부터 재개할 수 있습니다.'); } catch (_) {}
+}
+
+/** 중지 코어 (UI 없음) — 메뉴와 원격 API가 공유 */
+function pv_stopCore_(by) {
   const props = PropertiesService.getScriptProperties();
   const st = pv_loadState_();
   props.setProperty(PV.STOP_PROP, 'true');
   props.setProperty(VCONFIG.PROP.STOP, 'true');   // 문항 검증 체인도 중단
   pv_clearAllTriggers_();
+  let stoppedFrom = '';
   if (st && !['done', 'error', 'stopped'].includes(st.stage)) {
+    stoppedFrom = st.stage;
     st.stoppedFrom = st.stage;
     st.stage = 'stopped';
     pv_saveState_(st);
-    pv_log_(st, 'stopped', `사용자 중지 (중단 시점 단계: ${st.stoppedFrom})`);
+    pv_log_(st, 'stopped', `${by || '중지'} (중단 시점 단계: ${stoppedFrom})`);
   }
-  try { SpreadsheetApp.getUi().alert('파이프라인을 중지했습니다.\n[⏯ 이어하기] 메뉴로 중단 지점부터 재개할 수 있습니다.'); } catch (_) {}
+  return { ok: true, stoppedFrom: stoppedFrom };
 }
 
 /** 메뉴: 이어하기 — 중지/정체 상태에서 현재 단계부터 재기동 */
 function pv_resume() {
-  const ui = SpreadsheetApp.getUi();
+  const r = pv_resumeCore_({ deferTick: false, by: '수동 이어하기 (pv_resume)' });
+  if (!r.ok) { try { SpreadsheetApp.getUi().alert(r.reason); } catch (_) {} }
+}
+
+/**
+ * 이어하기 코어 (UI 없음) — 메뉴와 원격 API가 공유.
+ * @param {Object} opts  `deferTick`(헤드리스는 true), `by`(로그 문구)
+ */
+function pv_resumeCore_(opts) {
+  opts = opts || {};
   const props = PropertiesService.getScriptProperties();
   const st = pv_loadState_();
-  if (!st) { ui.alert('실행 이력이 없습니다.'); return; }
+  if (!st) return { ok: false, reason: '실행 이력이 없습니다.' };
   if (['done', 'error'].includes(st.stage)) {
-    ui.alert(`이미 종료된 파이프라인입니다 (${st.stage}).\n새로 시작하려면 [▶️ 파이프라인 시작]을 사용하세요.`);
-    return;
+    return { ok: false, reason: `이미 종료된 파이프라인입니다 (${st.stage}). 새로 시작하려면 start를 사용하세요.` };
   }
   if (st.stage === 'stopped') {
     st.stage = st.stoppedFrom || 'load';
@@ -227,9 +323,11 @@ function pv_resume() {
   }
 
   pv_saveState_(st);
-  pv_log_(st, st.stage, '수동 이어하기 (pv_resume)' + (wasFatal ? ` — 직전 중단 사유: ${wasFatal}` : '') + queueNote);
+  pv_log_(st, st.stage, (opts.by || '이어하기') + (wasFatal ? ` — 직전 중단 사유: ${wasFatal}` : '') + queueNote);
   pv_createWatchdog_();
-  pv_tick();
+  if (opts.deferTick) ScriptApp.newTrigger(PV.TICK_FN).timeBased().after(60 * 1000).create();
+  else pv_tick();
+  return { ok: true, stage: st.stage };
 }
 
 /** 메뉴: 상태 확인 */
@@ -390,7 +488,7 @@ function pv_runStage_(st, deadline) {
           ? `재검증 완료 — 전부 해소 (총 ${st.retry.round}라운드)`
           : 'error/timeout 행 없음 — 재검증 생략');
         st.retry.remain = [];
-        st.stage = 'quality';
+        st.stage = pv_afterRetry_(st);   // C8
         return 'next';
       }
 
@@ -399,7 +497,7 @@ function pv_runStage_(st, deadline) {
           st.retry.remain = targets.map(t => t.row);
           pv_log_(st, 'retry',
             `라운드 한도(${PV.RETRY_MAX_ROUNDS}) 도달 — 미해결 ${targets.length}행: ${pv_short_(st.retry.remain)} → 계속 진행 (D3)`);
-          st.stage = 'quality';
+          st.stage = pv_afterRetry_(st);   // C8
           return 'next';
         }
         st.retry.round++;
@@ -432,6 +530,13 @@ function pv_runStage_(st, deadline) {
 
     /* ── 4. 논리 검증 (STEP3): 전체 1패스 + error 재시도 1패스 ── */
     case 'quality': {
+      // C8 방어: quality=0인데 이어하기/옛 상태로 이 단계에 재진입한 경우
+      if (!pv_wantQuality_(st)) {
+        st.qualitySkipped = true;
+        pv_log_(st, 'quality', '논리 검증(STEP3) 건너뜀 — 재진입 방어 (quality=0)');
+        st.stage = 'stack';
+        return 'next';
+      }
       if (!st.quality) st.quality = { pass: 1, cursor: 2, remain: [] };
       const sheet = ss.getSheetByName(PV.DATA_SHEET);
       const qPrompts = loadQualityPrompts_();
@@ -505,6 +610,23 @@ function pv_runStage_(st, deadline) {
 /* =================================================
  * 단계별 코어 (UI 없음)
  * ================================================= */
+
+/**
+ * C8 — STEP3(논리 검증) 실행 여부.
+ * `opts`가 없는 옛 상태(진행 중이던 런의 이어하기)와 메뉴 실행은 기본 true로 보아
+ * 기존 동작을 그대로 유지한다. 끄려면 명시적으로 `opts.quality === false`.
+ */
+function pv_wantQuality_(st) {
+  return !st || !st.opts || st.opts.quality !== false;
+}
+
+/** C8 — retry 완료 후 다음 단계. 건너뛰는 경우 그 사실을 로그에 남긴다. */
+function pv_afterRetry_(st) {
+  if (pv_wantQuality_(st)) return 'quality';
+  st.qualitySkipped = true;
+  pv_log_(st, 'quality', '논리 검증(STEP3) 건너뜀 — 헤드리스 옵션 quality=0');
+  return 'stack';
+}
 
 /** Latex변환 파일 ID (스크립트 속성 우선) */
 function pv_latexFileId_() {
@@ -763,7 +885,8 @@ function pv_summary_(st) {
   if (st.retry) lines.push(
     `재검증: ${st.retry.round}라운드` +
     (st.retry.remain && st.retry.remain.length ? `, 미해결 ${st.retry.remain.length}행 (${pv_short_(st.retry.remain)})` : ' — 전부 해소'));
-  if (st.quality) lines.push(
+  if (st.qualitySkipped) lines.push('논리 검증: 건너뜀 (quality=0)');   // C8
+  else if (st.quality) lines.push(
     `논리 검증: 패스 ${st.quality.pass}` +
     (st.quality.remain && st.quality.remain.length ? `, 미해결 ${st.quality.remain.length}행 (${pv_short_(st.quality.remain)})` : ''));
   if (st.stack) lines.push(
