@@ -21,7 +21,7 @@
  */
 
 const RAPI = {
-  VERSION:     'audition-1.0.1',        // 배포 대조용. 코드 변경 시 올린다
+  VERSION:     'audition-1.0.2',        // 배포 대조용. 코드 변경 시 올린다
   PROJECT:     'audition',
   TOKEN_PROP:  'REMOTE_TOKEN',
   LOG_TAIL:    20,                      // status가 돌려줄 Pipeline_Log 최대 행수
@@ -59,6 +59,7 @@ function doGet(e) {
       case 'stop':        return rapi_json_(pv_stopCore_('원격 중지 (RemoteApi)'));
       case 'resume':      return rapi_json_(pv_resumeCore_({ deferTick: true, by: '원격 이어하기 (RemoteApi)' }));
       case 'result':      return rapi_json_(rapi_result_(p));
+      case 'keycheck':    return rapi_json_(rapi_keycheck_(p));
       case 'drivetoken':  return rapi_json_(rapi_driveToken_());
       default:            return rapi_json_({ ok: false, reason: 'unknown cmd: ' + p.cmd });
     }
@@ -115,8 +116,53 @@ function rapi_status_() {
     running:  props.getProperty(VCONFIG.PROP.RUNNING) === 'true',
     qRunning: props.getProperty('Q_RUNNING') === 'true',
     stopFlag: props.getProperty(PV.STOP_PROP) === 'true',
+    // 1.0.2: verify 단계의 행 단위 진척. state만으로는 2시간짜리 verify가
+    //        "느린 것"인지 "멈춘 것"인지 구분이 안 된다(러너 정체 판정용).
+    progress: {
+      currentRow:    rapi_intProp_(props, VCONFIG.PROP.CURRENT),
+      endRow:        rapi_intProp_(props, VCONFIG.PROP.END),
+      lastHeartbeat: rapi_intProp_(props, VCONFIG.PROP.HEARTBEAT),   // ms epoch
+    },
     at:       new Date().toISOString(),
   };
+}
+
+function rapi_intProp_(props, key) {
+  const v = parseInt(props.getProperty(key), 10);
+  return isNaN(v) ? null : v;
+}
+
+/**
+ * 키워드 사전 점검 (읽기 전용, 1.0.2).
+ * 적재(`pv_load_`)와 **같은 판정 함수**로 Latex변환 `Data_DS`를 훑어, 이번 런 키워드에
+ * 이미 걸리는 행이 있는지 센다. 0이 아니면 러너는 crop 전에 멈춘다 —
+ * 적재가 부분 문자열 일치라 같은 이름 재실행·겹치는 이름이 옛 행을 끌어오기 때문.
+ *   keywords : 쉼표/줄바꿈 구분
+ * 응답: { ok, total, byKeyword:{kw:n}, samples:[{row,key}] (최대 10) }
+ */
+function rapi_keycheck_(p) {
+  const keywords = pv_parseKeywords_(p.keywords);
+  if (!keywords.length) return { ok: false, reason: 'keywords 파라미터가 비어 있습니다.' };
+  const src = SpreadsheetApp.openById(pv_latexFileId_()).getSheetByName(PV.LATEX_SRC_SHEET);
+  if (!src) return { ok: false, reason: 'Latex변환 파일에 ' + PV.LATEX_SRC_SHEET + ' 시트가 없습니다.' };
+  const last = src.getLastRow();
+  const byKeyword = {}, samples = [];
+  keywords.forEach(k => { byKeyword[k] = 0; });
+  let total = 0;
+  if (last >= 2) {
+    const one = keywords.map(k => ({ k: k, m: pv_keyMatcher_([k]) }));
+    src.getRange(2, 1, last - 1, 1).getValues().forEach((r, i) => {
+      const key = String(r[0] || '').trim();
+      if (!key) return;
+      let hit = false;
+      one.forEach(o => { if (o.m(key)) { byKeyword[o.k]++; hit = true; } });
+      if (hit) {
+        total++;
+        if (samples.length < 10) samples.push({ row: i + 2, key: key });
+      }
+    });
+  }
+  return { ok: true, total: total, byKeyword: byKeyword, samples: samples, scannedRows: Math.max(last - 1, 0) };
 }
 
 /**

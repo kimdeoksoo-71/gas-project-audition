@@ -639,6 +639,19 @@ function pv_latexFileId_() {
  * 문제검토 Data_DS 초기화(A~AC) 후 A~K 붙여넣기
  */
 /** 유니코드 NFC 정규화 (한글 NFD/NFC 불일치 흡수 — latex-convert 의 nfc_ 와 동일) */
+/**
+ * 키워드 판정 함수. `pv_load_`(적재)와 `rapi_keycheck_`(러너 사전 점검)가 **함께 쓴다** —
+ * 두 곳의 규칙이 어긋나면 사전 점검이 무의미해지므로 한 곳에만 둔다.
+ * 규칙: NFC + 소문자로 맞춘 뒤 **부분 문자열 일치**(v1.1). 그래서 `모의1`은 `모의10`에도 걸린다.
+ */
+function pv_keyMatcher_(keywords) {
+  const kws = keywords.map(k => pv_nfc_(k).toLowerCase());     // v1.1: NFC 비교
+  return key => {
+    const kl = pv_nfc_(key).toLowerCase();
+    return kws.some(k => kl.indexOf(k) !== -1);
+  };
+}
+
 function pv_nfc_(s) {
   s = String(s == null ? '' : s);
   return s.normalize ? s.normalize('NFC') : s;
@@ -653,7 +666,7 @@ function pv_load_(ss, keywords) {
   if (last < 2) throw new Error('Latex변환 Data_DS에 데이터가 없습니다.');
 
   const vals = src.getRange(2, 1, last - 1, 11).getValues();   // A~K
-  const kws = keywords.map(k => pv_nfc_(k).toLowerCase());   // v1.1: NFC 비교
+  const matches = pv_keyMatcher_(keywords);
 
   const excludedNoE = [];
   const rowsOut = [];
@@ -661,8 +674,7 @@ function pv_load_(ss, keywords) {
   vals.forEach((r, i) => {
     const key = String(r[0] || '').trim();
     if (!key) return;
-    const kl = pv_nfc_(key).toLowerCase();                      // v1.1: NFC 비교
-    if (!kws.some(k => kl.indexOf(k) !== -1)) return;
+    if (!matches(key)) return;
     found++;
     if (String(r[4] || '').trim() === '') {   // E열(정규화 문제) 빈 행 제외 (D6)
       excludedNoE.push(i + 2);
