@@ -118,11 +118,12 @@ const _MPB = (function () {
               math_inline_delimiters: ['$', '$'],
               math_block_delimiters: ['$$','$$'],
               enable_tables: true,
-              confidence_threshold: 0.0
+              confidence_threshold: 0.0,
+              include_equation_tags: true   // 식 번호 `⋯⋯ ㉠` → 수식 안 \tag{ㄱ} (MathpixTagNormalize.gs 가 \tag{1} 로 정규화)
             }
           });
 
-          const merged = result.text || '';
+          const merged = mpx_normalizeEquationTags_(result.text || '');   // \tag{ㄱ}→\tag{1} · equation*/align* 정리
           sh.getRange(row, CFG.COLS.latex).setValue(merged);
           sh.getRange(row, CFG.COLS.text).setValue('');
           sh.getRange(row, CFG.COLS.status).setValue('done');
@@ -259,11 +260,12 @@ const _MPB = (function () {
               math_inline_delimiters: ['$', '$'],
               math_block_delimiters: ['$$', '$$'],
               enable_tables: true,
-              confidence_threshold: 0.0
+              confidence_threshold: 0.0,
+              include_equation_tags: true   // 식 번호 `⋯⋯ ㉠` → 수식 안 \tag{ㄱ} (MathpixTagNormalize.gs 가 \tag{1} 로 정규화)
             }
           });
 
-          const merged = result.text || '';
+          const merged = mpx_normalizeEquationTags_(result.text || '');   // \tag{ㄱ}→\tag{1} · equation*/align* 정리
           sh.getRange(row, CFG.COLS.latex).setValue(merged);
           sh.getRange(row, CFG.COLS.text).setValue('');
           sh.getRange(row, CFG.COLS.status).setValue('done');
