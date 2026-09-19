@@ -21,7 +21,7 @@
  */
 
 const RAPI = {
-  VERSION:     'audition-1.0.0',        // 배포 대조용. 코드 변경 시 올린다
+  VERSION:     'audition-1.0.1',        // 배포 대조용. 코드 변경 시 올린다
   PROJECT:     'audition',
   TOKEN_PROP:  'REMOTE_TOKEN',
   LOG_TAIL:    20,                      // status가 돌려줄 Pipeline_Log 최대 행수
@@ -120,25 +120,48 @@ function rapi_status_() {
 }
 
 /**
- * 판정 집계. Data_DS의 N열(문항 검증)과 U열(논리 검증)을 센다.
+ * 판정 집계. N열(문항 검증)과 U열(논리 검증)을 센다.
  * ⚠️ `quality=0`으로 돌린 런은 U열이 비어 있는 게 정상이다 — 오류가 아니다.
+ *
+ * 어디를 읽나 (2026-09-19 수정):
+ *   `stack` 단계가 결과를 Stack으로 옮긴 뒤 **Data_DS를 비운다**(mts_core_).
+ *   그래서 런이 끝난 뒤(stats/done)에 Data_DS를 읽으면 항상 0행이었다 — 러너가
+ *   결과를 묻는 시점이 바로 그때다. 이제는
+ *     Data_DS에 행이 있으면 → Data_DS (진행 중 / stack 전)
+ *     비어 있고 이번 런이 stack을 마쳤으면 → Stack의 st.stack.appendRow ~ endRow
+ *   Stack은 Data_DS의 A~AC를 같은 열 위치로 복사하므로 N·U 열 번호가 같다.
+ *   `errorRows`는 `source` 시트 기준 행 번호다.
  */
 function rapi_result_(p) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(PV.DATA_SHEET);
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return { ok: true, rows: 0, n: {}, q: {}, errorRows: [] };
+  const st = pv_loadState_();
+  const base = { ok: true, runId: (st && st.startedAt) || '', stage: (st && st.stage) || '',
+                 keywords: (st && st.keywords) || [] };
+
+  let sheet = ss.getSheetByName(PV.DATA_SHEET);
+  let first = 2, count = sheet.getLastRow() - 1;
+  let source = PV.DATA_SHEET;
+  if (count < 1) {
+    const sk = st && st.stack;
+    if (!sk || !sk.appendRow || !sk.endRow) {
+      return Object.assign(base, { source: '', rows: 0, n: {}, q: {}, errorRows: [],
+        note: 'Data_DS가 비어 있고 이번 런의 Stack 기록도 없음' });
+    }
+    sheet = ss.getSheetByName(MTS.DST_SHEET);
+    first = sk.appendRow; count = sk.endRow - sk.appendRow + 1; source = MTS.DST_SHEET;
+  }
 
   const n = {}, q = {}, errorRows = [];
-  const vals = sheet.getRange(2, 1, lastRow - 1, QCONFIG.COL.Q_VERDICT).getValues();
+  const vals = sheet.getRange(first, 1, count, QCONFIG.COL.Q_VERDICT).getValues();
   vals.forEach((row, i) => {
     const nv = String(row[13] || '').toLowerCase().trim() || '(빈칸)';                 // N열
     const qv = String(row[QCONFIG.COL.Q_VERDICT - 1] || '').toLowerCase().trim() || '(빈칸)';  // U열
     n[nv] = (n[nv] || 0) + 1;
     q[qv] = (q[qv] || 0) + 1;
-    if (nv === 'error' || nv === 'timeout' || qv === 'error' || qv === 'timeout') errorRows.push(i + 2);
+    if (nv === 'error' || nv === 'timeout' || qv === 'error' || qv === 'timeout') errorRows.push(first + i);
   });
-  return { ok: true, rows: lastRow - 1, n: n, q: q, errorRows: errorRows };
+  return Object.assign(base, { source: source, range: [first, first + count - 1],
+                               rows: count, n: n, q: q, errorRows: errorRows });
 }
 
 /**
