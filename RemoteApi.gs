@@ -21,7 +21,7 @@
  */
 
 const RAPI = {
-  VERSION:     'audition-1.0.3',        // 배포 대조용. 코드 변경 시 올린다
+  VERSION:     'audition-1.0.4',        // 배포 대조용. 코드 변경 시 올린다
   PROJECT:     'audition',
   TOKEN_PROP:  'REMOTE_TOKEN',
   LOG_TAIL:    20,                      // status가 돌려줄 Pipeline_Log 최대 행수
@@ -216,7 +216,7 @@ function rapi_result_(p) {
  * ================================================= */
 
 const RAPI_LEDGER = {
-  PROP:      'LEDGER_SHEET_ID',                        // 첫 기록 때 만들고 ID를 여기에 고정
+  PROP:      'LEDGER_SHEET_ID',                        // 첫 기록 때 찾은 ID를 여기에 고정
   NAME:      '자동화 작업 로그',
   FOLDER_ID: '13deQS_AYw3XvC42MlCz2F2PH1BB-3pIv',     // PBMAI/01_Sheet (덕수님 결정 2026-09-28)
   // [러너 키, 머리글]. 열 순서가 곧 시트 열 순서 — 바꾸면 기존 시트 머리글과 어긋나 기록을 거부한다.
@@ -233,7 +233,7 @@ const RAPI_LEDGER = {
 /**
  * 작업 로그 1행 기록. **run_id 기준 upsert** — 러너가 같은 행을 다시 보내도(재시도·밀린 동기화) 중복되지 않는다.
  *   row : 러너 ledger.row()의 JSON
- * 응답: { ok, row, url(행 앵커), created(이번에 시트를 새로 만들었나) }
+ * 응답: { ok, row, url(행 앵커) }
  */
 function rapi_ledger_(p) {
   let rec;
@@ -259,29 +259,45 @@ function rapi_ledger_(p) {
     }
     if (!r) r = last + 1;
     sh.getRange(r, 1, 1, cols.length).setValues([cols.map(c => rapi_ledgerCell_(rec[c[0]]))]);
-    return { ok: true, row: r, created: got.created,
+    return { ok: true, row: r,
              url: got.ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=A' + r };
   } finally {
     lock.releaseLock();
   }
 }
 
-/** 작업 로그 시트. 없으면 PBMAI/01_Sheet에 만들고 ID를 스크립트 속성에 고정한다. */
+/**
+ * 작업 로그 시트 — PBMAI/01_Sheet의 「자동화 작업 로그」를 **찾기만 한다**(1.0.4).
+ * 만들지 않는 이유 (2026-09-28 1.0.3 실측): 이 프로젝트의 Drive 권한은 **읽기 전용**이라
+ * 새 시트를 폴더로 옮기는 `moveTo`가 거부됐고, 그 전에 만든 시트가 루트에 고아로 남았다.
+ * 쓰기 권한을 새로 받으면 "모든 사용자" 웹앱의 피해 범위가 커지므로, 시트는 러너(rclone)가
+ * 머리글과 함께 만들어 두고 이쪽은 읽기 권한으로 찾아 기록만 한다.
+ * 찾은 ID는 스크립트 속성에 고정 — 이후엔 폴더를 다시 뒤지지 않는다.
+ */
 function rapi_ledgerSheet_() {
   const props = PropertiesService.getScriptProperties();
-  const id = props.getProperty(RAPI_LEDGER.PROP);
-  if (id) {
-    const ss = SpreadsheetApp.openById(id);
-    return { ss: ss, sheet: ss.getSheets()[0], created: false };
+  let id = props.getProperty(RAPI_LEDGER.PROP);
+  if (!id) {
+    const it = DriveApp.getFolderById(RAPI_LEDGER.FOLDER_ID).getFilesByName(RAPI_LEDGER.NAME);
+    const found = [];
+    while (it.hasNext()) {
+      const f = it.next();
+      if (!f.isTrashed() && f.getMimeType() === MimeType.GOOGLE_SHEETS) found.push(f.getId());
+    }
+    if (found.length !== 1) {
+      throw new Error('PBMAI/01_Sheet에서 「' + RAPI_LEDGER.NAME + '」 시트를 ' +
+                      (found.length ? found.length + '개 찾음(하나만 남겨 주세요)' : '찾지 못함(러너가 만들어 둬야 함)'));
+    }
+    id = found[0];
+    props.setProperty(RAPI_LEDGER.PROP, id);
   }
-  const ss = SpreadsheetApp.create(RAPI_LEDGER.NAME);
-  DriveApp.getFileById(ss.getId()).moveTo(DriveApp.getFolderById(RAPI_LEDGER.FOLDER_ID));
+  const ss = SpreadsheetApp.openById(id);
   const sh = ss.getSheets()[0];
-  sh.setName('로그');
-  sh.getRange(1, 1, 1, RAPI_LEDGER.COLS.length).setValues([RAPI_LEDGER.COLS.map(c => c[1])]).setFontWeight('bold');
-  sh.setFrozenRows(1);
-  props.setProperty(RAPI_LEDGER.PROP, ss.getId());
-  return { ss: ss, sheet: sh, created: true };
+  if (sh.getFrozenRows() === 0) {                      // 처음 쓸 때 머리글 고정·굵게 (Sheets 권한으로 충분)
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, RAPI_LEDGER.COLS.length).setFontWeight('bold');
+  }
+  return { ss: ss, sheet: sh };
 }
 
 /**
