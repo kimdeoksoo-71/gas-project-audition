@@ -21,7 +21,7 @@
  */
 
 const RAPI = {
-  VERSION:     'audition-1.0.2',        // 배포 대조용. 코드 변경 시 올린다
+  VERSION:     'audition-1.0.3',        // 배포 대조용. 코드 변경 시 올린다
   PROJECT:     'audition',
   TOKEN_PROP:  'REMOTE_TOKEN',
   LOG_TAIL:    20,                      // status가 돌려줄 Pipeline_Log 최대 행수
@@ -60,6 +60,7 @@ function doGet(e) {
       case 'resume':      return rapi_json_(pv_resumeCore_({ deferTick: true, by: '원격 이어하기 (RemoteApi)' }));
       case 'result':      return rapi_json_(rapi_result_(p));
       case 'keycheck':    return rapi_json_(rapi_keycheck_(p));
+      case 'ledger':      return rapi_json_(rapi_ledger_(p));
       case 'drivetoken':  return rapi_json_(rapi_driveToken_());
       default:            return rapi_json_({ ok: false, reason: 'unknown cmd: ' + p.cmd });
     }
@@ -208,6 +209,91 @@ function rapi_result_(p) {
   });
   return Object.assign(base, { source: source, range: [first, first + count - 1],
                                rows: count, n: n, q: q, errorRows: errorRows });
+}
+
+/* =================================================
+ * 「자동화 작업 로그」 (C9, 계획서 §6) — 1.0.3
+ * ================================================= */
+
+const RAPI_LEDGER = {
+  PROP:      'LEDGER_SHEET_ID',                        // 첫 기록 때 만들고 ID를 여기에 고정
+  NAME:      '자동화 작업 로그',
+  FOLDER_ID: '13deQS_AYw3XvC42MlCz2F2PH1BB-3pIv',     // PBMAI/01_Sheet (덕수님 결정 2026-09-28)
+  // [러너 키, 머리글]. 열 순서가 곧 시트 열 순서 — 바꾸면 기존 시트 머리글과 어긋나 기록을 거부한다.
+  COLS: [
+    ['run_id', '런 ID'], ['mode', '모드'], ['started', '시작'], ['finished', '종료'],
+    ['elapsed', '소요'], ['status', '상태'], ['exam_names', '시험지'], ['pdf_files', 'PDF 수'],
+    ['crop_png', '크롭 PNG'], ['crop_pdf', '크롭 PDF'], ['uploaded', '업로드'],
+    ['latex_rows', 'Latex 행'], ['latex_err', 'Latex 오류'], ['answer_miss', '정답 누락'],
+    ['verify_rows', '검증 행'], ['N_ok', 'N ok'], ['N_error', 'N 오류'], ['Q_ok', 'Q ok'],
+    ['Q_error', 'Q 오류'], ['stack_rows', 'Stack 행'], ['crop_engine', 'CroP 버전'], ['note', '비고'],
+  ],
+};
+
+/**
+ * 작업 로그 1행 기록. **run_id 기준 upsert** — 러너가 같은 행을 다시 보내도(재시도·밀린 동기화) 중복되지 않는다.
+ *   row : 러너 ledger.row()의 JSON
+ * 응답: { ok, row, url(행 앵커), created(이번에 시트를 새로 만들었나) }
+ */
+function rapi_ledger_(p) {
+  let rec;
+  try { rec = JSON.parse(p.row || ''); } catch (_) { return { ok: false, reason: 'row 파라미터가 JSON이 아닙니다.' }; }
+  if (!rec || !rec.run_id) return { ok: false, reason: 'row.run_id가 없습니다.' };
+
+  const lock = LockService.getUserLock();             // 파이프라인 tick의 script lock과 겹치지 않게
+  if (!lock.tryLock(20000)) return { ok: false, reason: '작업 로그 잠금 대기 초과' };
+  try {
+    const got = rapi_ledgerSheet_();
+    const sh = got.sheet, cols = RAPI_LEDGER.COLS;
+    const head = sh.getRange(1, 1, 1, cols.length).getValues()[0].map(String);
+    const want = cols.map(c => c[1]);
+    if (head.join('\u0001') !== want.join('\u0001')) {
+      return { ok: false, reason: '작업 로그 머리글이 기대와 다릅니다(열을 옮기거나 고쳤나요?): ' + head.join(', ') };
+    }
+    const last = sh.getLastRow();
+    let r = 0;
+    if (last >= 2) {
+      const ids = sh.getRange(2, 1, last - 1, 1).getValues();
+      const i = ids.findIndex(x => String(x[0]) === String(rec.run_id));
+      if (i >= 0) r = i + 2;
+    }
+    if (!r) r = last + 1;
+    sh.getRange(r, 1, 1, cols.length).setValues([cols.map(c => rapi_ledgerCell_(rec[c[0]]))]);
+    return { ok: true, row: r, created: got.created,
+             url: got.ss.getUrl() + '#gid=' + sh.getSheetId() + '&range=A' + r };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** 작업 로그 시트. 없으면 PBMAI/01_Sheet에 만들고 ID를 스크립트 속성에 고정한다. */
+function rapi_ledgerSheet_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty(RAPI_LEDGER.PROP);
+  if (id) {
+    const ss = SpreadsheetApp.openById(id);
+    return { ss: ss, sheet: ss.getSheets()[0], created: false };
+  }
+  const ss = SpreadsheetApp.create(RAPI_LEDGER.NAME);
+  DriveApp.getFileById(ss.getId()).moveTo(DriveApp.getFolderById(RAPI_LEDGER.FOLDER_ID));
+  const sh = ss.getSheets()[0];
+  sh.setName('로그');
+  sh.getRange(1, 1, 1, RAPI_LEDGER.COLS.length).setValues([RAPI_LEDGER.COLS.map(c => c[1])]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  props.setProperty(RAPI_LEDGER.PROP, ss.getId());
+  return { ss: ss, sheet: sh, created: true };
+}
+
+/**
+ * 셀 값. 배열은 쉼표로, [a,b] 범위는 "a~b"로.
+ * ⚠️ 시험지명은 PDF 파일명에서 오므로 `=`·`+`·`-`·`@`로 시작하면 수식으로 해석될 수 있다 → 앞에 ' 를 붙인다.
+ */
+function rapi_ledgerCell_(v) {
+  if (v === null || v === undefined) return '';
+  if (Array.isArray(v)) v = (v.length === 2 && v.every(x => typeof x === 'number')) ? v[0] + '~' + v[1] : v.join(', ');
+  if (typeof v === 'number' || typeof v === 'boolean') return v;
+  v = String(v);
+  return /^[=+\-@]/.test(v) ? "'" + v : v;
 }
 
 /**
