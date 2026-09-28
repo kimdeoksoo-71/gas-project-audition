@@ -481,6 +481,12 @@ function pv_runStage_(st, deadline) {
     case 'retry': {
       if (!st.retry) st.retry = { round: 0, inProgress: false, remain: [] };
       const sheet = ss.getSheetByName(PV.DATA_SHEET);
+      const dead = pv_takeDeadInflight_(st, 'retry');                     // v1.3.1: 어떤 행보다 먼저
+      if (dead) {
+        const dt = pv_scanErrorRows_(sheet, st.load.writeEnd).find(t => t.row === dead);
+        if (dt) pv_markPoisonRetry_(sheet, dt);
+        pv_log_(st, 'retry', `행 ${dead}: 직전 실행이 이 행 처리 중 강제 종료됨(GAS 6분 제한) → timeout 기록, 이번 런에선 건너뜀`);
+      }
       const scanned = pv_scanErrorRows_(sheet, st.load.writeEnd);
       const targets = scanned.filter(t => !pv_isPoison_(st, 'retry', t.row));      // v1.3
       const poisoned = scanned.filter(t => pv_isPoison_(st, 'retry', t.row)).map(t => t.row);
@@ -520,11 +526,7 @@ function pv_runStage_(st, deadline) {
           pv_log_(st, 'retry', `라운드 ${st.retry.round} 진행 중 시간 예산 소진 (${done}/${targets.length}) → 자동 이어하기`);
           return 'yield';   // 재진입 시 재스캔 → 남은 error 행만 다시 대상
         }
-        if (pv_poisonCheck_(st, 'retry', t.row)) {                       // v1.3
-          pv_markPoisonRetry_(sheet, t);
-          pv_log_(st, 'retry', `행 ${t.row}: 직전 실행이 이 행 처리 중 강제 종료됨(GAS 6분 제한) → timeout 기록 후 건너뜀`);
-          continue;
-        }
+        pv_inflightStart_(st, 'retry', t.row);                           // v1.3
         pv_retryRow_(sheet, t, pPr, sPr, deadline);
         pv_inflightDone_(st);
         done++;
@@ -553,6 +555,11 @@ function pv_runStage_(st, deadline) {
       if (!qPrompts) throw new Error('STEP3 프롬프트 로드 실패 (pmt 시트 확인)');
 
       const endRow = st.load.writeEnd;
+      const dead = pv_takeDeadInflight_(st, 'quality');                   // v1.3.1: 어떤 행보다 먼저
+      if (dead) {
+        sheet.getRange(dead, QCONFIG.COL.Q_VERDICT).setValue('timeout');
+        pv_log_(st, 'quality', `행 ${dead}: 직전 실행이 이 행 처리 중 강제 종료됨(GAS 6분 제한) → timeout 기록, 이번 런에선 건너뜀`);
+      }
       const uVals = sheet.getRange(2, QCONFIG.COL.Q_VERDICT, endRow - 1, 1).getValues();
 
       for (let row = st.quality.cursor; row <= endRow; row++) {
@@ -566,11 +573,7 @@ function pv_runStage_(st, deadline) {
           return 'yield';
         }
         st.quality.cursor = row;
-        if (pv_poisonCheck_(st, 'quality', row)) {                          // v1.3
-          sheet.getRange(row, QCONFIG.COL.Q_VERDICT).setValue('timeout');
-          pv_log_(st, 'quality', `행 ${row}: 직전 실행이 이 행 처리 중 강제 종료됨(GAS 6분 제한) → timeout 기록 후 건너뜀`);
-          continue;
-        }
+        pv_inflightStart_(st, 'quality', row);                              // v1.3
         verifyQualityForRow_(sheet, row, qPrompts, remaining);
         pv_inflightDone_(st);
         const qFatal = iv_getFatal_();   // v1.2: U='error' 로 남은 이 행부터 재개
@@ -825,7 +828,7 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
  * 새벽부터 매시간 죽음. 호출이 Gemini 쪽에서 끝났다면 비용도 매번 청구될 수 있다.)
  *
  * 행 처리 **직전에** `st.inflight = {stage,row}`를 저장하고 끝나면 지운다.
- * 다음 tick이 같은 행의 inflight를 보면 = 직전 실행이 그 행에서 죽었다 →
+ * 다음 tick이 **단계에 들어오자마자** inflight를 보면 = 직전 실행이 그 행에서 죽었다 →
  * 그 행에 timeout을 기록하고 `st.poison[stage]`에 넣어 이번 런에서는 다시 시도하지 않는다.
  * 미해결로 남으므로 요약·Stack에서 보이고, 사람이 나중에 따로 재검증하면 된다.
  * ================================================= */
@@ -833,19 +836,27 @@ function pv_isPoison_(st, stage, row) {
   return !!(st.poison && st.poison[stage] && st.poison[stage].indexOf(row) >= 0);
 }
 
-/** 행 시작 직전 호출. true = 직전 실행이 이 행에서 죽었음(→ 건너뛸 것). false = inflight 기록 완료. */
-function pv_poisonCheck_(st, stage, row) {
+/**
+ * 단계 진입 시 **어떤 행보다 먼저** 호출. 살아 있는 실행은 행을 끝낼 때마다 inflight를 지우므로,
+ * 진입 시점에 이 단계의 inflight가 남아 있으면 = 직전 실행이 그 행에서 죽었다.
+ * → poison에 넣고 행 번호 반환(없으면 0). 표시·로그는 호출자가.
+ * (v1.3.1: v1.3은 행을 시작할 때 대조해서, 앞선 다른 행이 표시를 덮어써 죽은 기록이 사라졌다 — 실측 9/28)
+ */
+function pv_takeDeadInflight_(st, stage) {
   const f = st.inflight;
-  if (f && f.stage === stage && f.row === row) {
-    delete st.inflight;
-    st.poison = st.poison || {};
-    (st.poison[stage] = st.poison[stage] || []).push(row);
-    pv_saveState_(st);
-    return true;
-  }
+  if (!f || f.stage !== stage) return 0;
+  delete st.inflight;
+  st.poison = st.poison || {};
+  st.poison[stage] = st.poison[stage] || [];
+  if (st.poison[stage].indexOf(f.row) < 0) st.poison[stage].push(f.row);
+  pv_saveState_(st);
+  return f.row;
+}
+
+/** 행 처리 직전. ⚠️ 호출 전에 저장해야 실행이 죽어도 남는다. */
+function pv_inflightStart_(st, stage, row) {
   st.inflight = { stage: stage, row: row, at: new Date().toISOString() };
-  pv_saveState_(st);                                    // ⚠️ 호출 전에 저장해야 죽어도 남는다
-  return false;
+  pv_saveState_(st);
 }
 
 function pv_inflightDone_(st) {
