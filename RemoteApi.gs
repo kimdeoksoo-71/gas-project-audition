@@ -21,7 +21,7 @@
  */
 
 const RAPI = {
-  VERSION:     'audition-1.0.4',        // 배포 대조용. 코드 변경 시 올린다
+  VERSION:     'audition-1.0.5',        // 배포 대조용. 코드 변경 시 올린다
   PROJECT:     'audition',
   TOKEN_PROP:  'REMOTE_TOKEN',
   LOG_TAIL:    20,                      // status가 돌려줄 Pipeline_Log 최대 행수

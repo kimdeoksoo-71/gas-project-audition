@@ -481,20 +481,24 @@ function pv_runStage_(st, deadline) {
     case 'retry': {
       if (!st.retry) st.retry = { round: 0, inProgress: false, remain: [] };
       const sheet = ss.getSheetByName(PV.DATA_SHEET);
-      const targets = pv_scanErrorRows_(sheet, st.load.writeEnd);
+      const scanned = pv_scanErrorRows_(sheet, st.load.writeEnd);
+      const targets = scanned.filter(t => !pv_isPoison_(st, 'retry', t.row));      // v1.3
+      const poisoned = scanned.filter(t => pv_isPoison_(st, 'retry', t.row)).map(t => t.row);
 
       if (!targets.length) {
-        pv_log_(st, 'retry', st.retry.round
-          ? `재검증 완료 — 전부 해소 (총 ${st.retry.round}라운드)`
-          : 'error/timeout 행 없음 — 재검증 생략');
-        st.retry.remain = [];
+        pv_log_(st, 'retry', poisoned.length
+          ? `재검증 종료 — 강제 종료가 반복돼 건너뛴 ${poisoned.length}행 미해결: ${pv_short_(poisoned)} → 계속 진행`
+          : st.retry.round
+            ? `재검증 완료 — 전부 해소 (총 ${st.retry.round}라운드)`
+            : 'error/timeout 행 없음 — 재검증 생략');
+        st.retry.remain = poisoned;
         st.stage = pv_afterRetry_(st);   // C8
         return 'next';
       }
 
       if (!st.retry.inProgress) {
         if (st.retry.round >= PV.RETRY_MAX_ROUNDS) {
-          st.retry.remain = targets.map(t => t.row);
+          st.retry.remain = targets.map(t => t.row).concat(poisoned);
           pv_log_(st, 'retry',
             `라운드 한도(${PV.RETRY_MAX_ROUNDS}) 도달 — 미해결 ${targets.length}행: ${pv_short_(st.retry.remain)} → 계속 진행 (D3)`);
           st.stage = pv_afterRetry_(st);   // C8
@@ -516,7 +520,13 @@ function pv_runStage_(st, deadline) {
           pv_log_(st, 'retry', `라운드 ${st.retry.round} 진행 중 시간 예산 소진 (${done}/${targets.length}) → 자동 이어하기`);
           return 'yield';   // 재진입 시 재스캔 → 남은 error 행만 다시 대상
         }
+        if (pv_poisonCheck_(st, 'retry', t.row)) {                       // v1.3
+          pv_markPoisonRetry_(sheet, t);
+          pv_log_(st, 'retry', `행 ${t.row}: 직전 실행이 이 행 처리 중 강제 종료됨(GAS 6분 제한) → timeout 기록 후 건너뜀`);
+          continue;
+        }
         pv_retryRow_(sheet, t, pPr, sPr, deadline);
+        pv_inflightDone_(st);
         done++;
         const rFatal = iv_getFatal_();   // v1.2
         if (rFatal) return pv_haltFatal_(st, rFatal, `오류 행 재검증 라운드 ${st.retry.round} 행 ${t.row}`);
@@ -548,13 +558,21 @@ function pv_runStage_(st, deadline) {
       for (let row = st.quality.cursor; row <= endRow; row++) {
         const u = String(uVals[row - 2][0] || '').toLowerCase().trim();
         if (u && u !== 'error' && u !== 'timeout') continue;   // 완료 행 건너뜀 (재개 대응)
+        if (pv_isPoison_(st, 'quality', row)) continue;          // v1.3
         if (props.getProperty(PV.STOP_PROP) === 'true') { st.quality.cursor = row; return 'yield'; }
         const remaining = deadline - Date.now();
         if (remaining < QCONFIG.ROW_TIME_RESERVE_MS) {
           st.quality.cursor = row;
           return 'yield';
         }
+        st.quality.cursor = row;
+        if (pv_poisonCheck_(st, 'quality', row)) {                          // v1.3
+          sheet.getRange(row, QCONFIG.COL.Q_VERDICT).setValue('timeout');
+          pv_log_(st, 'quality', `행 ${row}: 직전 실행이 이 행 처리 중 강제 종료됨(GAS 6분 제한) → timeout 기록 후 건너뜀`);
+          continue;
+        }
         verifyQualityForRow_(sheet, row, qPrompts, remaining);
+        pv_inflightDone_(st);
         const qFatal = iv_getFatal_();   // v1.2: U='error' 로 남은 이 행부터 재개
         if (qFatal) { st.quality.cursor = row; return pv_haltFatal_(st, qFatal, `논리 검증(STEP3) 패스 ${st.quality.pass} 행 ${row}`); }
         Utilities.sleep(QCONFIG.INTER_ROW_COOLDOWN_MS);
@@ -798,6 +816,50 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
   }
 }
 
+/* =================================================
+ * v1.3 독이 되는 행 방어 (2026-09-28 실측)
+ * -------------------------------------------------
+ * Gemini 호출(UrlFetchApp)에는 타임아웃이 없다. 한 행이 GAS 실행 한도(6분)를 넘기면
+ * 실행이 **강제 종료**돼 로그도, 다음 예약 트리거도 남지 않는다 → watchdog(1시간)이
+ * 다시 깨워도 같은 행에서 또 죽는 무한 반복. (실례: 런 2026-09-27T11:29 retry 행 37,
+ * 새벽부터 매시간 죽음. 호출이 Gemini 쪽에서 끝났다면 비용도 매번 청구될 수 있다.)
+ *
+ * 행 처리 **직전에** `st.inflight = {stage,row}`를 저장하고 끝나면 지운다.
+ * 다음 tick이 같은 행의 inflight를 보면 = 직전 실행이 그 행에서 죽었다 →
+ * 그 행에 timeout을 기록하고 `st.poison[stage]`에 넣어 이번 런에서는 다시 시도하지 않는다.
+ * 미해결로 남으므로 요약·Stack에서 보이고, 사람이 나중에 따로 재검증하면 된다.
+ * ================================================= */
+function pv_isPoison_(st, stage, row) {
+  return !!(st.poison && st.poison[stage] && st.poison[stage].indexOf(row) >= 0);
+}
+
+/** 행 시작 직전 호출. true = 직전 실행이 이 행에서 죽었음(→ 건너뛸 것). false = inflight 기록 완료. */
+function pv_poisonCheck_(st, stage, row) {
+  const f = st.inflight;
+  if (f && f.stage === stage && f.row === row) {
+    delete st.inflight;
+    st.poison = st.poison || {};
+    (st.poison[stage] = st.poison[stage] || []).push(row);
+    pv_saveState_(st);
+    return true;
+  }
+  st.inflight = { stage: stage, row: row, at: new Date().toISOString() };
+  pv_saveState_(st);                                    // ⚠️ 호출 전에 저장해야 죽어도 남는다
+  return false;
+}
+
+function pv_inflightDone_(st) {
+  delete st.inflight;
+  pv_saveState_(st);
+}
+
+/** retry 대상 행에 timeout 기록 (N·Q 중 재검증 대상이던 쪽만) */
+function pv_markPoisonRetry_(sheet, t) {
+  const note = '실행 시간 초과(GAS 6분)로 강제 종료 반복 — 자동 건너뜀, 수동 재검증 필요';
+  if (t.retryProblem)  sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3).setValues([['timeout', '', note]]);
+  if (t.retrySolution) sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2).setValues([['timeout', note]]);
+}
+
 /**
  * v1.2: 치명적 API 오류로 파이프라인 정지.
  * 'stopped' + stoppedFrom 으로 두어 [⏯ 이어하기]가 중단 단계부터 재개하게 한다.
@@ -897,6 +959,9 @@ function pv_summary_(st) {
   if (st.retry) lines.push(
     `재검증: ${st.retry.round}라운드` +
     (st.retry.remain && st.retry.remain.length ? `, 미해결 ${st.retry.remain.length}행 (${pv_short_(st.retry.remain)})` : ' — 전부 해소'));
+  if (st.poison) Object.keys(st.poison).forEach(k => {                   // v1.3
+    if (st.poison[k].length) lines.push(`강제 종료 반복으로 건너뜀(${k}): ${pv_short_(st.poison[k])}`);
+  });
   if (st.qualitySkipped) lines.push('논리 검증: 건너뜀 (quality=0)');   // C8
   else if (st.quality) lines.push(
     `논리 검증: 패스 ${st.quality.pass}` +
