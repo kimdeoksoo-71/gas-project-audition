@@ -18,8 +18,10 @@
  *     어휘: clean / garbage / check / skip / error / timeout — U열의 ok/fail과 섞지 않는다
  *     (fail은 Stack에서 "틀린 해설"의 집계 기준이라 군더더기가 들어가면 오염된다).
  *   - STEP3 판정 로직(verifyQualityForRow_·Q_TYPES·synthesizeQuality_)·U/V/W/X 는 **무변경**.
- *   - 운영은 통합: 실행기 하나(사이드바 모드 논리/군더더기/둘 다), 상태·중단 키 Q_* 공유,
- *     파이프라인 quality 단계가 행마다 STEP3→STEP4 (Pipelineverify.gs, PV_RUN_GARBAGE 로 on/off).
+ *   - 운영은 통합: 실행기 하나(사이드바 모드 논리/군더더기/둘 다), 상태·중단 키 Q_* 공유.
+ *   - 파이프라인: (2026-10-02, Pipelineverify v1.4) quality 다음 **별도 단계 `garbage`** 가 행마다
+ *     verifyGarbageForRow_ 를 부른다. 켜고 끄기는 런의 opts.garbage — 메뉴는 시작할 때 묻고,
+ *     원격 API 는 garbage=1 일 때만. (옛 설계의 PV_RUN_GARBAGE 속성은 쓰인 적 없이 폐기)
  *   - ⚠ 행당 서버 호출은 검증마다 따로다 — `둘 다`는 행마다 qr_processRow 를 두 번 부른다
  *     (실행기 예산 270초에 STEP3 한 행이 100~200초라 한 호출에 합치면 timeout).
  *   - ⚠ 대상 선별·재개·재검증은 U와 Z 를 **각각** 본다 — STEP3가 끝난 행에 군더더기만 소급할 수 있고,
@@ -74,7 +76,6 @@
  *   (v5) AB(28) garbage_audit   감사 추적 (첫 줄 judge=모델·후보 수)
  *
  * ScriptProperties:
- *   PV_RUN_GARBAGE   (선택, v5) 'false' 면 파이프라인 quality 단계에서 STEP4 를 건너뜀 (미설정 = 실행)
  *   CLAUDE_API_KEY   (필수) Anthropic API 키
  *   Q_GEMINI_MODEL   (선택) 기본 gemini-3.1-pro-preview — STEP3 전용 1차 모델(전환 메뉴와 무관하게 고정)
  *   Q_CLAUDE_MODEL   (선택) 기본 claude-opus-4-8
@@ -145,20 +146,12 @@ const QCONFIG = {
     },                   // AC(29)는 여유로 남긴다. Movetostack 이 A~AC 를 통째로 이관하므로 Stack 에도 같은 자리.
     HEADERS: { 26: 'garbage_verdict', 27: 'garbage_report', 28: 'garbage_audit' },
   },
-  /* 파이프라인 스위치(ScriptProperty). 'false' 일 때만 STEP4 를 건너뛴다 — 미설정 = 실행. 실행기는 모드로 고른다. */
-  RUN_GARBAGE_PROP: 'PV_RUN_GARBAGE',
-
   PROP: {
     STOP:      'Q_STOP',
     RUNNING:   'Q_RUNNING',
     HEARTBEAT: 'Q_LAST_HEARTBEAT',
   },
 };
-
-/** v5: 파이프라인이 STEP4 를 돌릴지 (PV_RUN_GARBAGE !== 'false') */
-function q_runGarbageEnabled_() {
-  return PropertiesService.getScriptProperties().getProperty(QCONFIG.RUN_GARBAGE_PROP) !== 'false';
-}
 
 
 /* ═══════════════════════════════════════════════

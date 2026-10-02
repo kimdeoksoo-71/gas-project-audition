@@ -21,7 +21,7 @@
  */
 
 const RAPI = {
-  VERSION:     'audition-1.0.6',        // 배포 대조용. 코드 변경 시 올린다
+  VERSION:     'audition-1.0.7',        // 배포 대조용. 코드 변경 시 올린다 (1.0.7: STEP4 연결)
   PROJECT:     'audition',
   TOKEN_PROP:  'REMOTE_TOKEN',
   LOG_TAIL:    20,                      // status가 돌려줄 Pipeline_Log 최대 행수
@@ -81,7 +81,7 @@ function rapi_ping_() {
  * 파이프라인 시작.
  *   keywords : 쉼표/줄바꿈 구분 (필수)
  *   quality  : 0이면 STEP3 건너뜀 (C8). 기본 1
- *   garbage  : 자리만 확보 — 동작 없음
+ *   garbage  : 1이면 STEP4(군더더기 검출) 실행. 기본 0 (1.0.7)
  *   force    : 1이면 진행 중인 파이프라인을 중단하고 새로 시작
  *   presave  : 'discard'면 미저장 결과를 Stack에 옮기지 않고 버림. 기본 저장
  *
@@ -93,7 +93,7 @@ function rapi_start_(p) {
   if (!keywords.length) return { ok: false, reason: 'keywords 파라미터가 비어 있습니다.' };
   return pv_startCore_(keywords, {
     quality:   p.quality !== '0',
-    garbage:   false,
+    garbage:   p.garbage === '1',
     force:     p.force === '1',
     preSave:   p.presave === 'discard' ? 'discard' : 'save',
     deferTick: true,
@@ -198,17 +198,21 @@ function rapi_result_(p) {
     first = sk.appendRow; count = sk.endRow - sk.appendRow + 1; source = MTS.DST_SHEET;
   }
 
-  const n = {}, q = {}, errorRows = [];
-  const vals = sheet.getRange(first, 1, count, QCONFIG.COL.Q_VERDICT).getValues();
+  const n = {}, q = {}, g = {}, errorRows = [], gErrorRows = [];
+  const zCol = QCONFIG.G.COL.G_VERDICT;                                               // 1.0.7: Z(STEP4)까지 읽는다
+  const vals = sheet.getRange(first, 1, count, Math.max(QCONFIG.COL.Q_VERDICT, zCol)).getValues();
   vals.forEach((row, i) => {
     const nv = String(row[13] || '').toLowerCase().trim() || '(빈칸)';                 // N열
     const qv = String(row[QCONFIG.COL.Q_VERDICT - 1] || '').toLowerCase().trim() || '(빈칸)';  // U열
+    const gv = String(row[zCol - 1] || '').toLowerCase().trim() || '(빈칸)';             // Z열
     n[nv] = (n[nv] || 0) + 1;
     q[qv] = (q[qv] || 0) + 1;
+    g[gv] = (g[gv] || 0) + 1;
     if (nv === 'error' || nv === 'timeout' || qv === 'error' || qv === 'timeout') errorRows.push(first + i);
+    if (gv === 'error' || gv === 'timeout') gErrorRows.push(first + i);   // errorRows 와 섞지 않는다(러너 경고 문구가 다름)
   });
   return Object.assign(base, { source: source, range: [first, first + count - 1],
-                               rows: count, n: n, q: q, errorRows: errorRows });
+                               rows: count, n: n, q: q, g: g, errorRows: errorRows, gErrorRows: gErrorRows });
 }
 
 /* =================================================
@@ -227,6 +231,8 @@ const RAPI_LEDGER = {
     ['latex_rows', 'Latex 행'], ['latex_err', 'Latex 오류'], ['answer_miss', '정답 누락'],
     ['verify_rows', '검증 행'], ['N_ok', 'N ok'], ['N_error', 'N 오류'], ['Q_ok', 'Q ok'],
     ['Q_error', 'Q 오류'], ['stack_rows', 'Stack 행'], ['crop_engine', 'CroP 버전'], ['note', '비고'],
+    // 1.0.7: STEP4. **맨 뒤에만 덧붙인다** — 옛 시트는 이 머리글이 비어 있으므로 첫 기록 때 채운다(rapi_ledgerHeader_).
+    ['G_clean', 'G clean'], ['G_garbage', 'G garbage'], ['G_check', 'G check'], ['G_error', 'G 오류'],
   ],
 };
 
@@ -245,11 +251,8 @@ function rapi_ledger_(p) {
   try {
     const got = rapi_ledgerSheet_();
     const sh = got.sheet, cols = RAPI_LEDGER.COLS;
-    const head = sh.getRange(1, 1, 1, cols.length).getValues()[0].map(String);
-    const want = cols.map(c => c[1]);
-    if (head.join('\u0001') !== want.join('\u0001')) {
-      return { ok: false, reason: '작업 로그 머리글이 기대와 다릅니다(열을 옮기거나 고쳤나요?): ' + head.join(', ') };
-    }
+    const hres = rapi_ledgerHeader_(sh, cols.map(c => c[1]));
+    if (!hres.ok) return hres;
     const last = sh.getLastRow();
     let r = 0;
     if (last >= 2) {
@@ -264,6 +267,25 @@ function rapi_ledger_(p) {
   } finally {
     lock.releaseLock();
   }
+}
+
+/**
+ * 1.0.7: 머리글 대조. 기존 열은 **한 글자도 달라선 안 되고**, 맨 뒤에 새로 덧붙인 열의 머리글이
+ * 비어 있을 때만(=옛 시트) 채운다. 열이 모자라면 뒤에 추가한다. 가운데가 비었거나 다르면 거부(종전과 같음).
+ */
+function rapi_ledgerHeader_(sh, want) {
+  if (sh.getMaxColumns() < want.length) sh.insertColumnsAfter(sh.getMaxColumns(), want.length - sh.getMaxColumns());
+  const head = sh.getRange(1, 1, 1, want.length).getValues()[0].map(v => String(v).trim());
+  let filled = head.length;
+  while (filled > 0 && head[filled - 1] === '') filled--;                 // 뒤쪽 빈 머리글 개수
+  const prefixOk = head.slice(0, filled).join('\u0001') === want.slice(0, filled).join('\u0001');
+  if (!prefixOk || filled === 0) {
+    return { ok: false, reason: '작업 로그 머리글이 기대와 다릅니다(열을 옮기거나 고쳤나요?): ' + head.join(', ') };
+  }
+  if (filled < want.length) {
+    sh.getRange(1, filled + 1, 1, want.length - filled).setValues([want.slice(filled)]).setFontWeight('bold');
+  }
+  return { ok: true };
 }
 
 /**

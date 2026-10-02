@@ -1,5 +1,15 @@
 /*************************************************
- * PipelineVerify.gs — 원클릭 검증 파이프라인  v1.2 (2026-09-17)
+ * PipelineVerify.gs — 원클릭 검증 파이프라인  v1.4 (2026-10-02)
+ *
+ *  v1.4 (2026-10-02, audition-1.0.7): STEP4(군더더기 검출) 연결 + 강제 종료 안전망
+ *   - 새 단계 `garbage`: quality 다음·stack 앞. quality 와 같은 뼈대(죽은 inflight 판정·poison·STOP·
+ *     시간 예약·치명 오류 정지·2패스)로 verifyGarbageForRow_ 를 행마다 부른다. 결과는 Z/AA/AB.
+ *     한 행에 STEP3+STEP4 를 합치면 100~200초라 tick 예산·6분 제한에 걸려 단계를 나눴다.
+ *   - 켜고 끄기: 상태 opts.garbage (기본 false). 메뉴는 시작할 때 묻고(덕수님 D2-b),
+ *     원격 API 는 garbage=1 일 때만 켠다(러너 `/run g`·`/run qg`, D1-b). PV_RUN_GARBAGE 속성은 폐기.
+ *   - 안전망 트리거: tick 을 시작하면 7분 뒤 tick 트리거를 하나 미리 걸어 둔다. 한 행이 6분 제한으로
+ *     실행을 죽여도 시간당 watchdog(최대 1시간)을 기다리지 않고 7분 뒤 재개된다(9/30 81aa: 40분 정체).
+ *     정상 종료면 tick 이 늘 하던 대로 트리거를 지우고 다음 것을 다시 건다.
  *
  *  v1.2 패치(패치 14): 치명적 API 오류(Gemini 월 지출 한도·일일 한도 / Claude 크레딧) 시 즉시 멈춤
  *   - verify 폴링: 큐가 멈췄는데 API_FATAL/V_HALTED 가 있으면 완료로 오인하지 않고 정지
@@ -25,7 +35,8 @@
  *   2. verify  : 기존 문항 검증 트리거 체인(processVerificationQueue)
  *                시작 → 1분 간격 폴링으로 완료 대기 (+정체 자동 복구)
  *   3. retry   : N/Q열 error·timeout 행 헤드리스 재검증 (최대 2라운드)
- *   4. quality : STEP3 논리 검증 행 단위 루프 (전체 1패스 + error 1패스)
+ *   4. quality : STEP3 논리 검증 행 단위 루프 (전체 1패스 + error 1패스)   — opts.quality
+ *   4b. garbage: STEP4 군더더기 검출 행 단위 루프 (전체 1패스 + error 1패스) — opts.garbage (v1.4)
  *   5. stack   : Stack 저장 + AD(세트명)/AE(문항그룹) 자동 기입 (mts_core_ v4)
  *   6. stats   : 난이도 통계 재집계 (stat_core_)
  *   7. done    : Pipeline_Log 최종 요약 (메일 없음 — D7 결정)
@@ -40,6 +51,7 @@
  *  의존(같은 프로젝트의 전역):
  *   VCONFIG, QCONFIG, getPromptSet, loadQualityPrompts_,
  *   callGeminiWithRetry_, getFormatGuide, verifyQualityForRow_,
+ *   loadGarbagePrompts_, verifyGarbageForRow_, g_ensureHeaders_ (QualityVerification.gs v5),
  *   markRowAsTimeout_, deleteVerifyTriggers_, scheduleNextBatch_,
  *   mts_core_ (Movetostack.gs v3), stat_core_ (StatCalc.gs v3),
  *   lw_wrapBareMath_ (LatexWrap.gs), parseRowRange (MainMenu.gs)
@@ -66,6 +78,8 @@ const PV = {
 
   RETRY_MAX_ROUNDS:   2,   // D3: STEP1·2 재검증 최대 라운드
   QUALITY_MAX_PASSES: 2,   // D3: STEP3 = 전체 1패스 + error 재시도 1패스
+  GARBAGE_MAX_PASSES: 2,   // v1.4: STEP4 도 같은 원칙
+  SAFETY_TICK_MS: 7 * 60 * 1000,   // v1.4: 안전망 tick — GAS 실행 상한(6분)보다 길어야 살아 있는 실행과 겹치지 않는다
   VERIFY_STALE_MIN:  20,   // 문항 검증 heartbeat 정체 판정(분)
 };
 
@@ -117,17 +131,28 @@ function pv_start() {
     preSave = (r === ui.Button.YES) ? 'save' : 'discard';
   }
 
-  // ── 4. 코어 실행 (최종 확인은 코어 호출 직전) ──
+  // ── 4. v1.4: STEP4(군더더기 검출) 여부 — 덕수님 D2-b: 숨은 설정 없이 시작할 때 고른다 ──
+  const g = ui.alert('군더더기 검출(STEP4)',
+    '논리 검증(STEP3) 다음에 군더더기 검출(STEP4)도 할까요?\n\n' +
+    '예(YES): 함께 실행 — 행마다 Gemini·Claude 를 한 번 더 부릅니다(시간·비용 추가)\n' +
+    '아니오(NO): STEP4 없이 진행 (나중에 사이드바 실행기로 할 수 있음)\n' +
+    '취소: 중단',
+    ui.ButtonSet.YES_NO_CANCEL);
+  if (g !== ui.Button.YES && g !== ui.Button.NO) return;
+  const wantGarbage = (g === ui.Button.YES);
+
+  // ── 5. 코어 실행 (최종 확인은 코어 호출 직전) ──
   const ok = ui.alert('확인',
     `키워드 ${keywords.length}개: ${keywords.join(' | ')}\n\n` +
     `Data_DS(2행 이하)를 초기화한 뒤 아래를 자동 실행합니다:\n` +
     `검색·붙여넣기 → 문항 검증(STEP1·2) → error 재검증 → 논리 검증(STEP3)\n` +
+    (wantGarbage ? `→ 군더더기 검출(STEP4) ` : `(STEP4 없음) `) +
     `→ Stack 저장(+세트명·문항그룹 자동 기입) → 난이도 통계\n\n` +
     `진행 상황: Pipeline_Log 시트 / [📋 상태 확인] 메뉴\n계속할까요?`,
     ui.ButtonSet.YES_NO);
   if (ok !== ui.Button.YES) return;
 
-  const r = pv_startCore_(keywords, { quality: true, force: true, preSave: preSave, deferTick: false });
+  const r = pv_startCore_(keywords, { quality: true, garbage: wantGarbage, force: true, preSave: preSave, deferTick: false });
   if (!r.ok) ui.alert('시작 실패', r.reason, ui.ButtonSet.OK);
   else if (r.preSavedRows) ui.alert(`기존 결과 ${r.preSavedRows}행을 Stack에 먼저 저장했습니다.`);
 }
@@ -142,7 +167,7 @@ function pv_start() {
  * @param {string[]} keywords  검색 키워드 (NFC 정규화된 상태여야 함)
  * @param {Object}   opts
  *   - `quality`  {boolean} STEP3(논리 검증) 실행. 기본 true (C8)
- *   - `garbage`  {boolean} STEP4. **자리만 확보, 동작 없음** — 나중에 켤 때 API를 안 바꾸기 위함
+ *   - `garbage`  {boolean} STEP4(군더더기 검출) 실행. **기본 false** (v1.4 — 비용이 커서 켤 때만)
  *   - `force`    {boolean} 진행 중 파이프라인을 중단하고 새로 시작. 기본 false
  *   - `preSave`  {'save'|'discard'} 미저장 결과 발견 시 처리. 기본 'save'
  *   - `deferTick`{boolean} true면 첫 tick을 직접 돌리지 않고 1분 뒤 트리거로 예약.
@@ -171,7 +196,8 @@ function pv_startCore_(keywords, opts) {
 
   // ── 1. 사전 점검 ──
   const wantQuality = opts.quality !== false;
-  const problems = pv_preflight_({ quality: wantQuality });
+  const wantGarbage = opts.garbage === true;                       // v1.4
+  const problems = pv_preflight_({ quality: wantQuality, garbage: wantGarbage });
   if (problems.length) return { ok: false, reason: '사전 점검 실패: ' + problems.join(' / ') };
 
   // ── 2. 기존 결과 보호 ──
@@ -186,14 +212,15 @@ function pv_startCore_(keywords, opts) {
   const st = {
     stage: 'load', keywords: keywords, startedAt: new Date().toISOString(),
     resumes: 0, preSavedRows: preSavedRows,
-    opts: { quality: wantQuality, garbage: false },   // C8
-    load: null, verify: null, retry: null, quality: null, stack: null, stats: null, error: ''
+    opts: { quality: wantQuality, garbage: wantGarbage },   // C8 · v1.4
+    load: null, verify: null, retry: null, quality: null, garbage: null, stack: null, stats: null, error: ''
   };
   props.setProperty(PV.STOP_PROP, 'false');
   iv_clearFatal_();                                   // v1.2: 이전 치명적 오류 표시 해제
   props.deleteProperty(VCONFIG.PROP.HALTED);          // v1.2
   pv_saveState_(st);
-  pv_log_(st, 'start', `키워드: ${keywords.join(' | ')}` + (wantQuality ? '' : ' (STEP3 건너뜀)'));
+  pv_log_(st, 'start', `키워드: ${keywords.join(' | ')}` + (wantQuality ? '' : ' (STEP3 건너뜀)') +
+    (wantGarbage ? ' (STEP4 군더더기 검출 포함)' : ''));
   pv_createWatchdog_();
 
   if (opts.deferTick) {
@@ -234,6 +261,8 @@ function pv_preflight_(opts) {
   if (!sP.system || !sP.user) problems.push('pmt: gemini_solution_verify (system/user) 누락');
   if (opts.quality !== false && !loadQualityPrompts_())
     problems.push('pmt: gemini_quality_verify / claude_quality_judge (system/user) 누락');
+  if (opts.garbage === true && !loadGarbagePrompts_())                                    // v1.4
+    problems.push('pmt: gemini_garbage_verify / claude_garbage_judge (system/user) 누락');
   if (!ss.getSheetByName('Stack')) problems.push('Stack 시트 없음');
   if (!ss.getSheetByName('Stat'))  problems.push('Stat 시트 없음');
   try {
@@ -351,6 +380,8 @@ function pv_tick() {
   try {
     pv_clearTickTriggers_();                        // 1회용 트리거 정리
     if (!st || ['done', 'error', 'stopped'].includes(st.stage)) return;
+    // v1.4 안전망: 이 실행이 6분 제한으로 죽어도 7분 뒤 다시 깨운다. 정상 종료 경로는 아래에서 지우고 다시 건다.
+    ScriptApp.newTrigger(PV.TICK_FN).timeBased().after(PV.SAFETY_TICK_MS).create();
 
     if (props.getProperty(PV.STOP_PROP) === 'true') {
       st.stoppedFrom = st.stage; st.stage = 'stopped';
@@ -378,9 +409,11 @@ function pv_tick() {
       if (st.resumes >= PV.MAX_RESUMES) throw new Error(`이어하기 횟수 초과 (${PV.MAX_RESUMES})`);
       st.resumes++;
       pv_saveState_(st);
+      pv_clearTickTriggers_();                      // v1.4: 안전망을 정식 이어하기로 바꾼다
       ScriptApp.newTrigger(PV.TICK_FN).timeBased().after(delayMs).create();
       return;
     }
+    pv_clearTickTriggers_();                        // v1.4: 이어하기가 필요 없으면 안전망도 치운다
   } catch (e) {
     if (st) {
       st.stage = 'error';
@@ -546,7 +579,7 @@ function pv_runStage_(st, deadline) {
       if (!pv_wantQuality_(st)) {
         st.qualitySkipped = true;
         pv_log_(st, 'quality', '논리 검증(STEP3) 건너뜀 — 재진입 방어 (quality=0)');
-        st.stage = 'stack';
+        st.stage = pv_afterQuality_(st);   // v1.4
         return 'next';
       }
       if (!st.quality) st.quality = { pass: 1, cursor: 2, remain: [] };
@@ -592,6 +625,63 @@ function pv_runStage_(st, deadline) {
       }
       st.quality.remain = remainErr;
       pv_log_(st, 'quality', `논리 검증 완료 (패스 ${st.quality.pass})` +
+        (remainErr.length ? ` — 미해결 ${remainErr.length}행: ${pv_short_(remainErr)} → 계속 진행 (D3)` : ''));
+      st.stage = pv_afterQuality_(st);   // v1.4
+      return 'next';
+    }
+
+    /* ── 4b. 군더더기 검출 (STEP4, v1.4): quality 와 같은 뼈대 — 전체 1패스 + error 재시도 1패스 ── */
+    case 'garbage': {
+      if (!pv_wantGarbage_(st)) {                                         // 재진입 방어
+        st.garbageSkipped = true;
+        pv_log_(st, 'garbage', '군더더기 검출(STEP4) 건너뜀 — 재진입 방어 (garbage=0)');
+        st.stage = 'stack';
+        return 'next';
+      }
+      if (!st.garbage) st.garbage = { pass: 1, cursor: 2, remain: [] };
+      const sheet = ss.getSheetByName(PV.DATA_SHEET);
+      const gPrompts = loadGarbagePrompts_();
+      if (!gPrompts) throw new Error('STEP4 프롬프트 로드 실패 (pmt 시트의 gemini_garbage_verify / claude_garbage_judge 확인)');
+      if (st.garbage.pass === 1 && st.garbage.cursor === 2) g_ensureHeaders_(sheet);   // Z~AB 머리글 (처음 한 번)
+
+      const endRow = st.load.writeEnd;
+      const zCol = QCONFIG.G.COL.G_VERDICT;
+      const dead = pv_takeDeadInflight_(st, 'garbage');                   // 어떤 행보다 먼저
+      if (dead) {
+        sheet.getRange(dead, zCol).setValue('timeout');
+        pv_log_(st, 'garbage', `행 ${dead}: 직전 실행이 이 행 처리 중 강제 종료됨(GAS 6분 제한) → timeout 기록, 이번 런에선 건너뜀`);
+      }
+      const zVals = sheet.getRange(2, zCol, endRow - 1, 1).getValues();
+
+      for (let row = st.garbage.cursor; row <= endRow; row++) {
+        const z = String(zVals[row - 2][0] || '').toLowerCase().trim();
+        if (z && z !== 'error' && z !== 'timeout') continue;   // 완료 행 건너뜀 (재개 대응)
+        if (pv_isPoison_(st, 'garbage', row)) continue;
+        if (props.getProperty(PV.STOP_PROP) === 'true') { st.garbage.cursor = row; return 'yield'; }
+        const remaining = deadline - Date.now();
+        if (remaining < QCONFIG.ROW_TIME_RESERVE_MS) {
+          st.garbage.cursor = row;
+          return 'yield';
+        }
+        st.garbage.cursor = row;
+        pv_inflightStart_(st, 'garbage', row);
+        verifyGarbageForRow_(sheet, row, gPrompts, remaining);
+        pv_inflightDone_(st);
+        const gFatal = iv_getFatal_();   // Z='error' 로 남은 이 행부터 재개
+        if (gFatal) { st.garbage.cursor = row; return pv_haltFatal_(st, gFatal, `군더더기 검출(STEP4) 패스 ${st.garbage.pass} 행 ${row}`); }
+        Utilities.sleep(QCONFIG.INTER_ROW_COOLDOWN_MS);
+      }
+      SpreadsheetApp.flush();
+
+      const remainErr = pv_scanGarbageUnresolved_(sheet, endRow);
+      if (remainErr.length && st.garbage.pass < PV.GARBAGE_MAX_PASSES) {
+        pv_log_(st, 'garbage', `패스 ${st.garbage.pass} 완료 — error/timeout ${remainErr.length}행 재시도: ${pv_short_(remainErr)}`);
+        st.garbage.pass++;
+        st.garbage.cursor = 2;
+        return 'next';
+      }
+      st.garbage.remain = remainErr;
+      pv_log_(st, 'garbage', `군더더기 검출 완료 (패스 ${st.garbage.pass})` +
         (remainErr.length ? ` — 미해결 ${remainErr.length}행: ${pv_short_(remainErr)} → 계속 진행 (D3)` : ''));
       st.stage = 'stack';
       return 'next';
@@ -646,6 +736,21 @@ function pv_afterRetry_(st) {
   if (pv_wantQuality_(st)) return 'quality';
   st.qualitySkipped = true;
   pv_log_(st, 'quality', '논리 검증(STEP3) 건너뜀 — 헤드리스 옵션 quality=0');
+  return pv_afterQuality_(st);   // v1.4
+}
+
+/**
+ * v1.4 — STEP4(군더더기 검출) 실행 여부. **명시적으로 켠 경우만** true.
+ * `opts.garbage`가 없는 옛 상태(1.0.6 이전에 시작된 런의 이어하기)는 끈 것으로 본다 — 종전 동작 그대로.
+ */
+function pv_wantGarbage_(st) {
+  return !!(st && st.opts && st.opts.garbage === true);
+}
+
+/** v1.4 — quality(또는 그 건너뜀) 다음 단계. 끈 런은 로그를 남기지 않는다(대부분이 끈 런이라 소음). */
+function pv_afterQuality_(st) {
+  if (pv_wantGarbage_(st)) return 'garbage';
+  st.garbageSkipped = true;
   return 'stack';
 }
 
@@ -747,6 +852,18 @@ function pv_scanQualityUnresolved_(sheet, endRow) {
   for (let i = 0; i < uVals.length; i++) {
     const u = String(uVals[i][0] || '').toLowerCase().trim();
     if (u === '' || u === 'error' || u === 'timeout') out.push(i + 2);
+  }
+  return out;
+}
+
+/** v1.4: Z열에서 미해결(빈칸·error·timeout) 행 스캔 (STEP4) */
+function pv_scanGarbageUnresolved_(sheet, endRow) {
+  if (!endRow || endRow < 2) return [];
+  const zVals = sheet.getRange(2, QCONFIG.G.COL.G_VERDICT, endRow - 1, 1).getValues();
+  const out = [];
+  for (let i = 0; i < zVals.length; i++) {
+    const z = String(zVals[i][0] || '').toLowerCase().trim();
+    if (z === '' || z === 'error' || z === 'timeout') out.push(i + 2);
   }
   return out;
 }
@@ -977,6 +1094,10 @@ function pv_summary_(st) {
   else if (st.quality) lines.push(
     `논리 검증: 패스 ${st.quality.pass}` +
     (st.quality.remain && st.quality.remain.length ? `, 미해결 ${st.quality.remain.length}행 (${pv_short_(st.quality.remain)})` : ''));
+  if (st.garbage) lines.push(                                                             // v1.4
+    `군더더기 검출: 패스 ${st.garbage.pass}` +
+    (st.garbage.remain && st.garbage.remain.length ? `, 미해결 ${st.garbage.remain.length}행 (${pv_short_(st.garbage.remain)})` : ''));
+  else if (st.garbageSkipped) lines.push('군더더기 검출: 건너뜀 (garbage=0)');
   if (st.stack) lines.push(
     `Stack: ${st.stack.rows}행 저장 (행 ${st.stack.appendRow}~${st.stack.endRow})` +
     (st.stack.emptyN && st.stack.emptyN.length ? `, 미검증 ${st.stack.emptyN.length}행` : '') +
