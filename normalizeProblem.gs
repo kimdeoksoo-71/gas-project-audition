@@ -214,7 +214,9 @@ function attachCircledMarker_(content, idx) {
  *  Mathpix(v3/pdf mmd)가 행 첫머리의 번호·기호("7.", "-", "(i)", "이 …")를 보고 곳곳을
  *  \begin{itemize}\item[X] … \end{itemize} 로 감싸는데(중첩 포함), 수능 문항·해설에는 진짜 목록 구조가 필요 없다.
  *   - \begin{itemize} / \end{itemize} (enumerate, description 포함) → 삭제
- *   - \item[X] → "X " (X 가 비면 삭제),  \item (대괄호 없음) → "- "
+ *   - \item[X] → "X " (X 가 비면 삭제),  \item (대괄호 없음) → 삭제(글머리 "- "를 만들지 않는다 — 2026-11-05)
+ *     라벨 X는 남긴다: 이 결과를 곧바로 ds_expectedType_(첫머리 문항 번호 "7.")와 parseMcqFromRaw_(선지 마커 (1)~(5)·①~⑤)가 읽는다.
+ *     Mathory 가져오기는 줄마다 hard break를 넣어 글머리 없이도 항목이 줄로 갈린다(Mathory 정돈 R6)
  *   - 각 항목은 자기 줄에서 시작하도록 유지, 줄 끝 공백·3줄 이상 연속 빈 줄 정리
  *  DSN.UNWRAP_ITEMIZE=true 면 B(원문)·C(해설)·E·F~J 모두에 적용된다.
  */
@@ -226,10 +228,10 @@ function unwrapItemize_(s) {
     .replace(/\n?[ \t]*\\end\{(?:itemize|enumerate|description)\}[ \t]*/g, '')
     .replace(/(^|\n)[ \t]*\\item\[\s*\]\s*/g, '$1')                    // \item[]   → 제거
     .replace(/(^|\n)[ \t]*\\item\[\s*([^\]]*?)\s*\][ \t]*/g, '$1$2 ')  // \item[X]  → "X "
-    .replace(/(^|\n)[ \t]*\\item\b[ \t]*/g, '$1- ')                    // \item     → "- "
+    .replace(/(^|\n)[ \t]*\\item\b[ \t]*/g, '$1')                      // \item     → 삭제(글머리 없음)
     .replace(/\\item\[\s*\]\s*/g, '')                                  // 줄 중간에 남은 것
     .replace(/\\item\[\s*([^\]]*?)\s*\][ \t]*/g, '\n$1 ')
-    .replace(/\\item\b[ \t]*/g, '\n- ')
+    .replace(/\\item\b[ \t]*/g, '\n')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n');
   return t.trim();
