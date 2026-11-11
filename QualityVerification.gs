@@ -77,8 +77,8 @@
  *
  * ScriptProperties:
  *   CLAUDE_API_KEY   (필수) Anthropic API 키
- *   Q_GEMINI_MODEL   (선택) 기본 gemini-3.1-pro-preview — STEP3 전용 1차 모델(전환 메뉴와 무관하게 고정)
- *   Q_CLAUDE_MODEL   (선택) 기본 claude-opus-4-8
+ *   Q_GEMINI_MODEL   (선택) 기본 gemini-4-argon — STEP3 전용 1차 모델(전환 메뉴와 무관하게 고정)
+ *   Q_CLAUDE_MODEL   (선택) 기본 claude-opus-5-5
  *   Q_STOP / Q_RUNNING / Q_LAST_HEARTBEAT — 실행 상태
  *
  * 재사용(Itemverification.gs의 전역 함수, 수정 없음):
@@ -98,12 +98,12 @@ const QCONFIG = {
   DATA_SHEET: 'Data_DS',
 
   /* 1차: Gemini — 전환 메뉴(V_GEMINI_MODEL)와 무관하게 STEP3 전용으로 고정 */
-  GEMINI_MODEL: PropertiesService.getScriptProperties().getProperty('Q_GEMINI_MODEL') || 'gemini-3.1-pro-preview',
+  GEMINI_MODEL: PropertiesService.getScriptProperties().getProperty('Q_GEMINI_MODEL') || 'gemini-4-argon',
   GEMINI_THINKING_LEVEL: 'HIGH',
 
-  /* 2차: Claude Opus 4.8 — adaptive thinking + effort
+  /* 2차: Claude Opus 5.5 — adaptive thinking + effort (effort 기본값이 medium이라 high 명시 필수)
      주의: temperature/top_p 등 샘플링 파라미터는 지원되지 않음(설정 시 400) */
-  CLAUDE_MODEL: PropertiesService.getScriptProperties().getProperty('Q_CLAUDE_MODEL') || 'claude-opus-4-8',
+  CLAUDE_MODEL: PropertiesService.getScriptProperties().getProperty('Q_CLAUDE_MODEL') || 'claude-opus-5-5',
   CLAUDE_MAX_TOKENS: 16000,          // thinking + 응답 합산 하드캡
   CLAUDE_EFFORT: 'high',
   ANTHROPIC_VERSION: '2023-06-01',
@@ -804,7 +804,7 @@ function synthesizeGarbage_(candidates, judgments, truncNote) {
    3. Gemini 호출 (STEP3 전용 — 모델 고정)
    ═══════════════════════════════════════════════
    기존 callGeminiUnified_는 전환 메뉴의 VCONFIG.GEMINI_MODEL을 사용하므로
-   STEP3의 "1차 = 3.1 Pro 고정" 원칙을 위해 전용 호출기를 둔다.
+   STEP3의 "1차 = 전용 모델 고정" 원칙을 위해 전용 호출기를 둔다.
    safeParseGeminiJson_ / is503Error_ 는 전역 함수라 그대로 재사용. */
 
 function callGeminiForQuality_(sys, usr, ast, timeBudgetMs, imgParts) {   // 패치 12: imgParts(선택)
@@ -944,7 +944,7 @@ function isClaudeRetryable_(errorMsg) {
 
 /**
  * Anthropic Messages API 단일 호출
- * - adaptive thinking + effort=high (Opus 4.8은 수동 budget_tokens 미지원)
+ * - adaptive thinking + effort=high (Opus 5.5는 수동 budget_tokens 미지원)
  * - temperature 등 샘플링 파라미터 설정 금지(400 반환)
  * - 응답 content에서 type:"text" 블록만 취합 (thinking 블록 무시)
  */

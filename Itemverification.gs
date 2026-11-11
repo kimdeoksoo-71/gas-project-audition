@@ -42,6 +42,11 @@
 
 /* ─── 모델 프리셋 ─── */
 const MODEL_PRESETS = {
+  'gemini-4-argon': {
+    label:     '4 Argon (GA 2026-10-13, 유료 등급 전용)',
+    gen:       '3.x',             // 3.x와 같은 thinkingConfig 분기를 탄다(프리셋이 없으면 2.x 분기로 빠진다)
+    thinkingLevel: 'HIGH',
+  },
   'gemini-3.8-flash': {
     label:     '3.8 Flash (GA 2026-09-02, 최신 Flash)',
     gen:       '3.x',
