@@ -265,6 +265,7 @@ function pv_preflight_(opts) {
     problems.push('pmt: gemini_garbage_verify / claude_garbage_judge (system/user) 누락');
   if (!ss.getSheetByName('Stack')) problems.push('Stack 시트 없음');
   if (!ss.getSheetByName('Stat'))  problems.push('Stat 시트 없음');
+  if (!ss.getSheetByName(STAT22.DST_SHEET)) problems.push(STAT22.DST_SHEET + ' 시트 없음');   // renual P5: 신형식(0통합) 난이도 통계
   try {
     const t = SpreadsheetApp.openById(pv_latexFileId_());
     if (!t.getSheetByName(PV.LATEX_SRC_SHEET)) problems.push('Latex변환 파일에 Data_DS 시트 없음');
@@ -708,7 +709,8 @@ function pv_runStage_(st, deadline) {
       const r = stat_core_();
       if (!r.ok) throw new Error('난이도 통계 실패: ' + r.message);
       st.stats = r;
-      pv_log_(st, 'stats', `난이도 통계: 연속 구간 ${r.runs}개, 세트 집계 ${r.sets}개, 기준 미달 제외 ${r.skipped}개`);
+      pv_log_(st, 'stats', `난이도 통계: 연속 구간 ${r.runs}개, 세트 집계 ${r.sets}개` + (r.sets22 ? ` · Stat(22) ${r.sets22}개` : '') +
+        `, 기준 미달 제외 ${r.skipped}개` + (r.excluded ? ` · 문제집 제외 ${r.excluded}구간` : ''));
       st.stage = 'done';
       return 'next';
     }
@@ -811,11 +813,12 @@ function pv_load_(ss, keywords) {
 
   const dst = ss.getSheetByName(PV.DATA_SHEET);
   if (!dst) throw new Error('문제검토 Data_DS 시트를 찾을 수 없습니다.');
-  if (dst.getMaxColumns() < PV.NUM_COLS) {   // v4: A~AC 폭 보장
-    dst.insertColumnsAfter(dst.getMaxColumns(), PV.NUM_COLS - dst.getMaxColumns());
+  if (dst.getMaxColumns() < AM.DS_LAST_COL) {   // v4: A~AC 폭 보장 → renual: 새 열 AD~AF(정답 대조·교육과정)까지
+    dst.insertColumnsAfter(dst.getMaxColumns(), AM.DS_LAST_COL - dst.getMaxColumns());
   }
   const maxRows = dst.getMaxRows();
-  if (maxRows >= 2) dst.getRange(2, 1, maxRows - 1, PV.NUM_COLS).clearContent();   // A~AC 전체 클리어 (v4)
+  if (maxRows >= 2) dst.getRange(2, 1, maxRows - 1, AM.DS_LAST_COL).clearContent();   // A~AF 전체 클리어 (v4 A~AC + renual AD~AF — 앞 세트 값이 남지 않게, P5-9)
+  am_ensureHeaders_(dst, false);
   if (rowsOut.length) dst.getRange(2, 1, rowsOut.length, 11).setValues(rowsOut);
   SpreadsheetApp.flush();
 
@@ -884,6 +887,7 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
       if (stem === '') {
         sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3)
           .setValues([['skip', '', 'E열(문제) 비어있음']]);
+        am_writeRow_(sheet, t.row);   // renual D-1: 정답 대조(AD)
       } else {
         const formatGuide = getFormatGuide(answerType);
         const imgsP1 = iv_imageParts_([stem]);                       // 패치 13: 그림 첨부
@@ -902,6 +906,7 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
           String(pResult.derived_answer || '').trim(),
           lw_wrapBareMath_(String(pResult.solution_note || '').trim()),
         ]]);
+        am_writeRow_(sheet, t.row);   // renual D-1: 정답 대조(AD)
         sheet.getRange(t.row, VCONFIG.COL.THINKING_TOKENS)
           .setValue(pResult._usage?.thoughtsTokenCount || 0);
         sheet.getRange(t.row, VCONFIG.COL.MODEL_NAME).setValue(VCONFIG.GEMINI_MODEL);
@@ -984,7 +989,7 @@ function pv_inflightDone_(st) {
 /** retry 대상 행에 timeout 기록 (N·Q 중 재검증 대상이던 쪽만) */
 function pv_markPoisonRetry_(sheet, t) {
   const note = '실행 시간 초과(GAS 6분)로 강제 종료 반복 — 자동 건너뜀, 수동 재검증 필요';
-  if (t.retryProblem)  sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3).setValues([['timeout', '', note]]);
+  if (t.retryProblem)  { sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3).setValues([['timeout', '', note]]); am_writeRow_(sheet, t.row); }   // renual D-1
   if (t.retrySolution) sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2).setValues([['timeout', note]]);
 }
 
@@ -1102,7 +1107,7 @@ function pv_summary_(st) {
     `Stack: ${st.stack.rows}행 저장 (행 ${st.stack.appendRow}~${st.stack.endRow})` +
     (st.stack.emptyN && st.stack.emptyN.length ? `, 미검증 ${st.stack.emptyN.length}행` : '') +
     (st.stack.keyParseFail && st.stack.keyParseFail.length ? `, key 분해 실패 ${st.stack.keyParseFail.length}건` : ''));
-  if (st.stats) lines.push(`통계: 구간 ${st.stats.runs}, 세트 ${st.stats.sets}, 제외 ${st.stats.skipped}`);
+  if (st.stats) lines.push(`통계: 구간 ${st.stats.runs}, 세트 ${st.stats.sets}` + (st.stats.sets22 ? `, Stat(22) ${st.stats.sets22}` : '') + `, 제외 ${st.stats.skipped}`);
   if (st.fatal) lines.push(`⛔ API 한도 초과로 정지: ${st.fatal.label} (${st.fatal.where}) → 한도 조정 후 ⏯ 이어하기`);   // v1.2
   if (st.error) lines.push(`오류: ${st.error}`);
   return lines.join('\n');

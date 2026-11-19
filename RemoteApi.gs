@@ -21,7 +21,7 @@
  */
 
 const RAPI = {
-  VERSION:     'audition-1.0.7',        // 배포 대조용. 코드 변경 시 올린다 (1.0.7: STEP4 연결)
+  VERSION:     'audition-1.1.0',        // 배포 대조용. 코드 변경 시 올린다 (1.1.0: renual — normalizeProblem latex판 동일 · 정답 대조 AD→Stack AF · 새 열 AD~AF · Stat(22) 라우팅 / 1.0.7: STEP4 연결)
   PROJECT:     'audition',
   TOKEN_PROP:  'REMOTE_TOKEN',
   LOG_TAIL:    20,                      // status가 돌려줄 Pipeline_Log 최대 행수

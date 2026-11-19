@@ -161,25 +161,32 @@ function mts_core_() {
   if (dstSheet.getMaxColumns() < MTS.COL_GROUP) {
     dstSheet.insertColumnsAfter(dstSheet.getMaxColumns(), MTS.COL_GROUP - dstSheet.getMaxColumns());
   }
+  // renual D-1·M-2: Data_DS AD~AF(정답 대조·교육과정 부합·메모) → Stack AF~AH. 폭 보장 + 이관 직전 정답 대조 재계산(사람이 고친 D·O 반영)
+  am_ensureWidth_(srcSheet, AM.DS_LAST_COL);
+  am_ensureWidth_(dstSheet, AM.STACK_LAST_COL);
+  am_fillAll_(srcSheet);
 
   const numRows = srcLastRow - 1;
   const srcData = srcSheet.getRange(2, 1, numRows, MTS.NUM_COLS).getValues();
+  const srcExtra = srcSheet.getRange(2, AM.COL_MATCH, numRows, AM.DS_LAST_COL - AM.COL_MATCH + 1).getValues();
 
   // 완전히 빈 행 제거 — v4.1: 원본 Data_DS 행 번호를 함께 보존한다
   const valid = [];
   for (let i = 0; i < srcData.length; i++) {
-    if (srcData[i].some(cell => String(cell).trim() !== '')) valid.push({ srcRow: i + 2, data: srcData[i] });
+    if (srcData[i].some(cell => String(cell).trim() !== '')) valid.push({ srcRow: i + 2, data: srcData[i], extra: srcExtra[i] });
   }
   if (valid.length === 0) return fail('Data_DS에 유효한 데이터가 없습니다.');
   const validData = valid.map(v => v.data);
 
   // ── Stack 헤더 보장 (Y=fig_info, AD/AE=세트명/문항그룹) ──
   mts_ensureHeaders_(dstSheet);
+  am_ensureHeaders_(dstSheet, true);   // renual: AF~AH 정답 대조·교육과정 부합·교육과정 메모
 
   // ── Stack에 이어붙이기 (A~AC) ──
   const dstLastRow = dstSheet.getLastRow();
   const appendRow  = (dstLastRow >= 1) ? dstLastRow + 1 : 2;
   dstSheet.getRange(appendRow, 1, validData.length, MTS.NUM_COLS).setValues(validData);
+  dstSheet.getRange(appendRow, AM.STACK_COL, valid.length, AM.DS_LAST_COL - AM.COL_MATCH + 1).setValues(valid.map(v => v.extra));   // renual
 
   // ── N열 빈 행 기록 (경고용 — 저장은 진행, D2 결정) ──
   // v4.1: 원본 Data_DS 행 번호(emptyNRows)와 이관된 Stack 행 번호(emptyNStackRows)를 함께 남긴다
@@ -210,7 +217,7 @@ function mts_core_() {
   // ── Data_DS 2행 이하 비우기 (서식 유지) ──
   const maxRows = srcSheet.getMaxRows();
   if (maxRows >= 2) {
-    srcSheet.getRange(2, 1, maxRows - 1, MTS.NUM_COLS).clearContent();
+    srcSheet.getRange(2, 1, maxRows - 1, AM.DS_LAST_COL).clearContent();   // A~AC + renual AD~AF
   }
   SpreadsheetApp.flush();
 

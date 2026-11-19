@@ -351,6 +351,7 @@ function processVerificationQueue() {
       if (stem === '') {
         sheet.getRange(currentRow, VCONFIG.COL.P_VERDICT, 1, 3)
           .setValues([['skip', '', 'E열(문제) 비어있음']]);
+        am_writeRow_(sheet, currentRow);   // renual D-1: 정답 대조(AD)
       } else {
         const t1 = Date.now();
         const formatGuide = getFormatGuide(answerType);
@@ -375,6 +376,7 @@ function processVerificationQueue() {
 
         sheet.getRange(currentRow, VCONFIG.COL.P_VERDICT, 1, 3)
           .setValues([[verdict, derived, note]]);
+        am_writeRow_(sheet, currentRow);   // renual D-1: 정답 대조(AD)
 
         // S열: STEP 1 thinking 토큰 수 기록 (난이도 지표)
         const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
@@ -428,6 +430,7 @@ function processVerificationQueue() {
     } catch (e) {
       Logger.log(`Row ${currentRow} error: ${e.message}`);
       sheet.getRange(currentRow, VCONFIG.COL.P_VERDICT).setValue('error');
+      am_writeRow_(sheet, currentRow);   // renual D-1: 정답 대조(AD)
       sheet.getRange(currentRow, VCONFIG.COL.P_NOTE).setValue(`[Error] ${e.message}`);
 
       // ── 패치 14: 치명적 API 오류 → 이 행만 error 로 남기고 큐 즉시 정지 (남은 행은 빈칸 유지) ──
@@ -523,6 +526,7 @@ function testSingleRowVerification() {
         String(pResult.derived_answer || ''),
         `[TEST] ${String(pResult.solution_note || '')}`
       ]]);
+      am_writeRow_(sheet, rowNum);   // renual D-1: 정답 대조(AD)
 
       // S열: thinking 토큰 수 기록
       const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
@@ -1426,6 +1430,7 @@ function markRowAsTimeout_(row, minutesSince) {
   const nVal = String(sheet.getRange(row, VCONFIG.COL.P_VERDICT).getValue() || '').trim();
   if (nVal === '') {
     sheet.getRange(row, VCONFIG.COL.P_VERDICT).setValue('timeout');
+    am_writeRow_(sheet, row);   // renual D-1: 정답 대조(AD)
     sheet.getRange(row, VCONFIG.COL.P_NOTE).setValue(note);
   }
 
@@ -1599,6 +1604,7 @@ function retryErrorRows() {
         if (stem === '') {
           sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3)
             .setValues([['skip', '', 'E열(문제) 비어있음']]);
+          am_writeRow_(sheet, t.row);   // renual D-1: 정답 대조(AD)
         } else {
           const formatGuide = getFormatGuide(answerType);
           const imgsR1 = iv_imageParts_([stem]);                    // 패치 12·13
@@ -1617,6 +1623,7 @@ function retryErrorRows() {
             String(pResult.derived_answer || '').trim(),
             String(pResult.solution_note || '').trim(),
           ]]);
+          am_writeRow_(sheet, t.row);   // renual D-1: 정답 대조(AD)
 
           const thinkingTokens = pResult._usage?.thoughtsTokenCount || 0;
           sheet.getRange(t.row, VCONFIG.COL.THINKING_TOKENS).setValue(thinkingTokens);

@@ -9,6 +9,8 @@
  *  1) 문항번호로 객관식/주관식 선판정  (ds_expectedType_)
  *     - A열 key 의 번호와 B열 첫머리 인쇄 번호를 비교, 다르면 인쇄 번호 우선 + NUM_MISMATCH 경고
  *     - 공통 1~15 / 선택 23~28 → 객관식,  16~22 / 29~30 → 단답형  (DSN.QTYPE_RULES)
+ *     - 2028 통합형 세트(key 가 두 자리 학년도 27 이상으로 시작)는 1~21 객관식 / 22~30 단답형  (DSN.QTYPE_RULES_2028 · 2026-11-17)
+ *       key 에 학년도가 없어도 세트 구성이 2028 서킷 틀(공통 14~20 · 확통 26~28)이면 같은 규칙  (DSN.FRAME_2028_CIRCUIT · 2026-11-18)
  *     - key 가 규칙에 안 맞으면 선판정 없이 현행 방식(파싱 결과만)으로 판정
  *  2) 객관식이면 선지 토크나이저(parseMcqFromRaw_)로 5개 선지 추출
  *     - 마커 (1)~(5), （1）~（5）, ①~⑤, \textcircled{n} 을 모두 인정, 한 문항 안 혼용 허용
@@ -21,7 +23,7 @@
  *
  * 부수 효과(제자리 덮어쓰기)
  *  - B열: itemize 래퍼 제거(DSN.UNWRAP_ITEMIZE) + mcq 확정 행의 선지 마커 5곳만 ①~⑤ 로 통일 (DSN.REWRITE_RAW_MARKERS)
- *  - C열: 첫머리 "정답 (n)" → "정답 ⓝ" (기존) + itemize 래퍼 제거
+ *  - C열: 첫 3줄 안 `\section*{…}` 벗기기(2026-11-17) + 첫머리 "정답 (n)" → "정답 ⓝ" (기존) + itemize 래퍼 제거
  *
  * 진입점
  *  - 메뉴 '⏺️ 문항 정규화'      : ds_runNormalizeAndValidate_byRowInput  (행 범위 입력)
@@ -58,12 +60,85 @@ DSN.QTYPE_RULES = [
   { from: 29, to: 30, type: 'short' }
 ];
 // A열 key 에서 과목코드+번호: "…_1공통07" / "…_4미적28"  (CroP 명명 규칙. 이 코드가 있어야 신체제 시험지로 간주)
-const KEY_RE = /[1345](공통|확통|미적|기하)(\d{2})\s*$/;
+//   2026-11-19 renual P3(§2.4): 공용 키 규칙 — 코드·이름 짝 `0통합 · 1공통 · 3확통 · 4미적 · 5기하`(번호 2자리) ·
+//   `9순번 · 9기출`(문제집, 번호 3자리). 짝이 어긋난 키(`3공통07`·`9순번01` 등)는 키로 보지 않는다.
+//   그룹: m[1] 코드(예 '0통합') · m[2] 번호 (2자리 코드) / m[3] 코드 · m[4] 번호 (문제집) → ds_keyCode_ 로 꺼내 쓴다.
+const KEY_CODE_SRC = '(?:0통합|1공통|3확통|4미적|5기하)\\d{2}|9(?:순번|기출)\\d{3}';
+const KEY_RE = /(?:(0통합|1공통|3확통|4미적|5기하)(\d{2})|(9순번|9기출)(\d{3}))\s*$/;
+
+/** key → { code:'0통합', digit:'0', subject:'통합', num:7, kind:'exam'|'book' } | null (순수 함수) */
+function ds_keyCode_(key) {
+  const m = String(key ?? '').match(KEY_RE);
+  if (!m) return null;
+  const code = m[1] || m[3], no = m[2] || m[4];
+  return { code: code, digit: code.charAt(0), subject: code.slice(1), num: Number(no), kind: m[3] ? 'book' : 'exam' };
+}
 // 본문 첫머리 인쇄 문항번호: "12." / "12)" / "\begin{itemize}\item[12.]"
 const PRINTED_NUM_RE = /^\s*(?:\\begin\{itemize\}\s*\\item\[\s*(\d{1,2})\s*\.?\s*\]|(\d{1,2})\s*[.)])/;
 
-function qtypeFromNum_(num) {
-  const r = DSN.QTYPE_RULES.find(r => num >= r.from && num <= r.to);
+// 2028학년도 통합형 체제(2026-11-17): 객관식 1~21 / 단답형 22~30 (예시문항 정답표). 선택과목 구분이 없다.
+//   27CXTB 서킷(14~20 객관식 · 26~28 단답형)도 이 규칙에 든다. 옛 규칙으로 보면 16~20 이 단답형이 되어 선지를 읽지 않고
+//   `(1)`~`(5)` 마커도 그대로 남았다(27CXTB07회 실측 — 7394~7398행 short_int, 정답 칸 빈칸).
+DSN.QTYPE_RULES_2028 = [
+  { from: 1,  to: 21, type: 'mcq'   },
+  { from: 22, to: 30, type: 'short' }
+];
+// 통합형 세트의 key: 두 자리 학년도 27 이상으로 시작 — `27CXTB07회 (261116)_…` · `27모의X02_…` · `27서킷K04_…`.
+//   옛 체제의 `26모의X…`·`25서킷X…`(두 자리 26 이하), `2027강대모의고사X17회…`·`[2027]강대…`(네 자리 연도)는 해당하지 않는다.
+const KEY_2028_RE = /^\s*(\d{2})(?!\d)/;
+// 2028학년도 서킷 틀(2026-11-18): key 에 학년도가 없는 서킷 세트도 통합형으로 본다 — `서킷더베스트(07회)_261117` 런(7402~7411)이
+//   옛 규칙으로 판정돼 26~28 정규화 실패 3 · 정답 충돌 2 로 멈췄다. 이름만으로는 못 가른다(`서킷더베스트07회`(4240~)·
+//   `260211 서킷더베스트(06회)`(4386~)는 옛 12문항 틀). 그래서 **세트 구성**으로 가른다:
+//   세트(key 에서 `_과목NN` 을 뗀 앞부분)의 문항이 모두 이 틀 안에 있고 FRAME_2028_MIN 개 이상이면 통합형.
+//   옛 서킷 틀(12·14문항)은 1공통09~13·21·미적을 담으므로 걸리지 않는다(Data_DS 237세트 중 이 틀은 27CXTB07회·서킷더베스트(07회) 2세트뿐).
+DSN.FRAME_2028_CIRCUIT = ['1공통14', '1공통15', '1공통16', '1공통17', '1공통18', '1공통19', '1공통20', '3확통26', '3확통27', '3확통28'];
+DSN.FRAME_2028_MIN = 6;
+const KEY_SET_RE = new RegExp('^(.*?)_?(' + KEY_CODE_SRC + ')\\s*$');   // renual P3: 공용 키 규칙(KEY_CODE_SRC)
+let DS_SETS_2028_ = null;   // { 세트명: true } — 실행마다 Data_DS A열로 만든다 (ds_loadSets2028_)
+
+/** key → { set, code } (예: '서킷더베스트(07회)_261117_1공통16' → set '서킷더베스트(07회)_261117', code '1공통16') */
+function ds_splitKey_(key) {
+  const m = String(key ?? '').trim().match(KEY_SET_RE);
+  return (m && m[1].trim()) ? { set: m[1].trim(), code: m[2] } : null;
+}
+/** key 목록 → 2028 서킷 틀에 드는 세트 { 세트명: true }  (순수 함수) */
+function ds_sets2028FromKeys_(keys) {
+  const frame = new Set(DSN.FRAME_2028_CIRCUIT), bySet = {};
+  (keys || []).forEach(k => {
+    const s = ds_splitKey_(k); if (!s) return;
+    const e = bySet[s.set] || (bySet[s.set] = { codes: new Set(), out: false });
+    e.codes.add(s.code); if (!frame.has(s.code)) e.out = true;
+  });
+  const out = {};
+  Object.keys(bySet).forEach(n => { const e = bySet[n]; if (!e.out && e.codes.size >= DSN.FRAME_2028_MIN) out[n] = true; });
+  return out;
+}
+/** Data_DS A열을 읽어 DS_SETS_2028_ 를 새로 만든다. sh 가 없으면 활성 파일의 Data_DS. 실패해도 판정은 key 규칙으로 계속 */
+function ds_loadSets2028_(sh) {
+  try {
+    if (!sh) { if (typeof SpreadsheetApp === 'undefined') return DS_SETS_2028_; sh = SpreadsheetApp.getActive().getSheetByName(DSN.SHEET); }
+    if (!sh) return DS_SETS_2028_;
+    const last = sh.getLastRow();
+    const keys = last >= 2 ? sh.getRange(2, DSN.COL.key, last - 1, 1).getValues().map(r => String(r[0] || '')) : [];
+    DS_SETS_2028_ = ds_sets2028FromKeys_(keys);
+  } catch (_) {}
+  return DS_SETS_2028_;
+}
+/** 시험용: 세트 표를 직접 넣는다 */
+function ds_setSets2028_(map) { DS_SETS_2028_ = map || {}; }
+
+function ds_qtypeRules_(key) {
+  const kc = ds_keyCode_(key);                             // renual P3(§5): 과목코드 0(통합) 이 첫 판정. 아래 두 판정은 옛 키 호환용
+  if (kc && kc.digit === '0') return DSN.QTYPE_RULES_2028;
+  const m = String(key ?? '').match(KEY_2028_RE);
+  if (m && Number(m[1]) >= 27) return DSN.QTYPE_RULES_2028;
+  if (DS_SETS_2028_ === null) ds_loadSets2028_();
+  const s = ds_splitKey_(key);
+  return (s && DS_SETS_2028_ && DS_SETS_2028_[s.set]) ? DSN.QTYPE_RULES_2028 : DSN.QTYPE_RULES;
+}
+
+function qtypeFromNum_(num, rules) {
+  const r = (rules || DSN.QTYPE_RULES).find(r => num >= r.from && num <= r.to);
   return r ? r.type : null;
 }
 
@@ -75,16 +150,19 @@ function qtypeFromNum_(num) {
  */
 function ds_expectedType_(key, raw) {
   const warn = [];
-  const m = String(key ?? '').match(KEY_RE);
-  if (!m) return { subject: null, keyNum: null, printedNum: null, num: null, expected: null, warn: ['KEY_NO_MATCH'] };
-  const subject = m[1], keyNum = Number(m[2]);
+  const kc = ds_keyCode_(key);
+  if (!kc) return { subject: null, keyNum: null, printedNum: null, num: null, expected: null, warn: ['KEY_NO_MATCH'] };
+  const subject = kc.subject, keyNum = kc.num;
   const pm = String(raw ?? '').match(PRINTED_NUM_RE);
   const printedNum = pm ? Number(pm[1] || pm[2]) : null;
+  // renual P3(§5): 문제집(9순번·9기출)은 번호로 유형을 정하지 않는다 → 파싱 결과만으로 판정(현행 폴백과 같은 길)
+  if (kc.kind === 'book') return { subject, keyNum, printedNum, num: keyNum, expected: null, warn: ['NUM_RULE_NONE'] };
+  const rules = ds_qtypeRules_(key);                       // 2028 통합형 세트는 번호 규칙이 다르다
   let num = keyNum;
-  if (printedNum != null && printedNum !== keyNum && qtypeFromNum_(printedNum)) {
+  if (printedNum != null && printedNum !== keyNum && qtypeFromNum_(printedNum, rules)) {
     num = printedNum; warn.push('NUM_MISMATCH(key ' + keyNum + ' / printed ' + printedNum + ')');
   }
-  const expected = qtypeFromNum_(num);
+  const expected = qtypeFromNum_(num, rules);
   if (!expected) warn.push('NUM_OUT_OF_RANGE');
   return { subject, keyNum, printedNum, num, expected, warn };
 }
@@ -214,9 +292,7 @@ function attachCircledMarker_(content, idx) {
  *  Mathpix(v3/pdf mmd)가 행 첫머리의 번호·기호("7.", "-", "(i)", "이 …")를 보고 곳곳을
  *  \begin{itemize}\item[X] … \end{itemize} 로 감싸는데(중첩 포함), 수능 문항·해설에는 진짜 목록 구조가 필요 없다.
  *   - \begin{itemize} / \end{itemize} (enumerate, description 포함) → 삭제
- *   - \item[X] → "X " (X 가 비면 삭제),  \item (대괄호 없음) → 삭제(글머리 "- "를 만들지 않는다 — 2026-11-05)
- *     라벨 X는 남긴다: 이 결과를 곧바로 ds_expectedType_(첫머리 문항 번호 "7.")와 parseMcqFromRaw_(선지 마커 (1)~(5)·①~⑤)가 읽는다.
- *     Mathory 가져오기는 줄마다 hard break를 넣어 글머리 없이도 항목이 줄로 갈린다(Mathory 정돈 R6)
+ *   - \item[X] → "X " (X 가 비면 삭제),  \item (대괄호 없음) → "- "
  *   - 각 항목은 자기 줄에서 시작하도록 유지, 줄 끝 공백·3줄 이상 연속 빈 줄 정리
  *  DSN.UNWRAP_ITEMIZE=true 면 B(원문)·C(해설)·E·F~J 모두에 적용된다.
  */
@@ -228,10 +304,10 @@ function unwrapItemize_(s) {
     .replace(/\n?[ \t]*\\end\{(?:itemize|enumerate|description)\}[ \t]*/g, '')
     .replace(/(^|\n)[ \t]*\\item\[\s*\]\s*/g, '$1')                    // \item[]   → 제거
     .replace(/(^|\n)[ \t]*\\item\[\s*([^\]]*?)\s*\][ \t]*/g, '$1$2 ')  // \item[X]  → "X "
-    .replace(/(^|\n)[ \t]*\\item\b[ \t]*/g, '$1')                      // \item     → 삭제(글머리 없음)
+    .replace(/(^|\n)[ \t]*\\item\b[ \t]*/g, '$1- ')                    // \item     → "- "
     .replace(/\\item\[\s*\]\s*/g, '')                                  // 줄 중간에 남은 것
     .replace(/\\item\[\s*([^\]]*?)\s*\][ \t]*/g, '\n$1 ')
-    .replace(/\\item\b[ \t]*/g, '\n')
+    .replace(/\\item\b[ \t]*/g, '\n- ')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n');
   return t.trim();
@@ -331,7 +407,10 @@ function ds_normalizeRow_(sh, row, opts) {
       const solCell = sh.getRange(row, DSN.COL.solution);
       const solRaw = String(solCell.getDisplayValue() || '');
       if (solRaw) {
-        let solNorm = normalizeSolutionAnswerMarker_(solRaw);
+        // 2026-11-17 (계획 v4 A5): 첫 3줄 안의 `\section*{13.}` 을 먼저 벗긴다 — 번호 줄이 제목 명령에 싸여 있으면
+        //   정답 마커 정규화도, answer 단계의 번호 떼기도 그 줄을 못 알아본다(6811·6889·6964·6965행 실측, D열 비어 있음)
+        let solNorm = (typeof pp_unwrapSectionHead_ === 'function') ? pp_unwrapSectionHead_(solRaw) : solRaw;
+        solNorm = normalizeSolutionAnswerMarker_(solNorm);
         if (DSN.UNWRAP_ITEMIZE !== false) solNorm = unwrapItemize_(solNorm);
         if (solNorm !== solRaw) solCell.setValue(solNorm);
       }
@@ -358,6 +437,7 @@ function ds_normalizeRow_(sh, row, opts) {
 /** 여러 행 처리 + 통계 (UI 없음). Pipeline 과 메뉴가 공용 */
 function ds_normalizeRows_(sh, rows, opts) {
   const st = { ok: 0, fail: 0, failRows: [], review: [], warnRows: {}, warnCount: {} };
+  ds_loadSets2028_(sh);   // 2028 서킷 틀 세트 표를 이번 호출 시점의 A열로 (같은 실행에서 방금 보낸 행도 든다)
   for (const row of rows) {
     try {
       const r = ds_normalizeRow_(sh, row, opts);

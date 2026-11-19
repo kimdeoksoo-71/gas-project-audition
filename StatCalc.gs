@@ -25,6 +25,12 @@
  *    → 부수 효과: 어떤 그룹에도 매칭되지 않는 Z값도 총합에서 제외됨.
  *  - 공통 1~9번 zero-padding 표기 반영 (1공통01 ~ 1공통09).
  *
+ * [renual P5 — 2026-11-19] 신형식 `Stat(22)` 라우팅 (계획 v3 §7 StatCalc · X-02 · X-04)
+ *  - 세트 구간마다 문항그룹(AE)의 과목코드로 보낸다: `0통합` → **`Stat(22)`**(7묶음, 「형식변화」 `신형식` F열) /
+ *    1·3·4·5 → `Stat`(지금 그대로) / `9순번`·`9기출`(문제집) → 제외(S-4).  섞이면 옛 `Stat`(지금 동작).
+ *  - `Stat(22)` 세트 인정 = 유효 문항(S>0) **30개 이상**(X-04 — 30문항 전부 S>0. 신 `10` 서킷 세트는 들어가지 않음).
+ *    열: A 세트명 · B·C 행 · D model · E~K 7묶음 · L Total(7묶음 전부). 2행은 평균 함수(불가침), 기록은 3행부터.
+ *
  * 의존성: 없음 (API·트리거·LockService 미사용, 순수 시트 연산)
  * 메뉴 등록: MainMenu.gs → '📊 난이도 통계 계산' → calculateDifficultyStats
  * ============================================================
@@ -88,6 +94,38 @@ const STATCONFIG = {
 };
 
 
+/* renual P5: 신형식(0통합) 난이도 통계 — 묶음은 「형식변화」 신형식 시트 F열(stat 분류) */
+const STAT22 = {
+  DST_SHEET: 'Stat(22)',
+  MIN_SET_SIZE: 30,       // X-04
+  DST_START_ROW: 3,
+  DST_NUM_COLS: 12,       // A~L
+  TOTAL_COL: 12,          // L Total (7묶음 전부)
+  GROUPS: [
+    { col: 5,  name: '객2',    nums: [1, 3] },
+    { col: 6,  name: '객3',    nums: [4, 13] },
+    { col: 7,  name: '객4 중', nums: [14, 19] },
+    { col: 8,  name: '객4 고', nums: [20, 21] },
+    { col: 9,  name: '주3',    nums: [22, 25] },
+    { col: 10, name: '주4 중', nums: [26, 28] },
+    { col: 11, name: '주4 고', nums: [29, 30] },
+  ].map(g => { const keys = []; for (let n = g.nums[0]; n <= g.nums[1]; n++) keys.push('0통합' + String(n).padStart(2, '0')); return { col: g.col, name: g.name, keys: keys }; }),
+};
+
+/** 구간의 갈래: '22'(0통합만) | 'book'(9순번·9기출이 있음) | 'old'(그 밖 — 지금 동작) */
+function statRouteOfRun_(run, data) {
+  const GROUP_IDX = STATCONFIG.SRC_COL.GROUP - 1;
+  const digits = {};
+  for (let i = run.startIdx; i <= run.endIdx; i++) {
+    const m = String(data[i][GROUP_IDX] || '').trim().match(/^(\d)/);
+    if (m) digits[m[1]] = true;
+  }
+  const ds = Object.keys(digits);
+  if (digits['9']) return 'book';
+  if (ds.length === 1 && ds[0] === '0') return '22';
+  return 'old';
+}
+
 /* ═══════════════════════════════════════════════
    메뉴 진입점
    ═══════════════════════════════════════════════ */
@@ -102,6 +140,7 @@ function calculateDifficultyStats() {
     '📊 난이도 통계 계산 완료',
     `인식된 연속 구간: ${res.runs}개\n` +
     `세트로 집계됨 (유효 문항 ${STATCONFIG.MIN_SET_SIZE}개 이상): ${res.sets}개\n` +
+    `Stat(22) 신형식 세트 (유효 문항 ${STAT22.MIN_SET_SIZE}개 이상): ${res.sets22}개` + (res.excluded ? ` · 문제집 제외 ${res.excluded}구간` : '') + `\n` +
     `기준 미달로 제외: ${res.skipped}개\n\n` +
     `Stat 시트 ${STATCONFIG.DST_START_ROW}행부터 ` +
     `${res.sets}개 행이 기록되었습니다.\n` +
@@ -113,14 +152,16 @@ function calculateDifficultyStats() {
 /**
  * v3: 헤드리스 코어 — UI 없이 Stack 전체를 재집계해 Stat 3행 이하에 기록.
  * 원클릭 파이프라인(PipelineVerify.gs)에서 직접 호출.
- * @return {{ok:boolean, message:string, runs:number, sets:number, skipped:number}}
+ * @return {{ok:boolean, message:string, runs:number, sets:number, skipped:number, sets22:number, excluded:number}}
+ *   renual P5: sets = 옛 Stat 행 수, sets22 = Stat(22) 행 수, excluded = 문제집 구간 수, skipped = 두 시트 기준 미달 합
  */
 function stat_core_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const src = ss.getSheetByName(STATCONFIG.SRC_SHEET);
   const dst = ss.getSheetByName(STATCONFIG.DST_SHEET);
 
-  const fail = (msg) => ({ ok: false, message: msg, runs: 0, sets: 0, skipped: 0 });
+  const fail = (msg) => ({ ok: false, message: msg, runs: 0, sets: 0, skipped: 0, sets22: 0, excluded: 0 });
+  const dst22 = ss.getSheetByName(STAT22.DST_SHEET);   // renual P5 — 없으면 신형식 구간이 있을 때만 실패
 
   if (!src) return fail(`'${STATCONFIG.SRC_SHEET}' 시트를 찾을 수 없습니다.`);
   if (!dst) return fail(`'${STATCONFIG.DST_SHEET}' 시트를 찾을 수 없습니다.`);
@@ -147,11 +188,16 @@ function stat_core_() {
   const statRows = [];
   let skippedRuns = 0;
 
+  const statRows22 = [];
+  let excludedRuns = 0;
   for (const run of runs) {
-    const row = statBuildStatRow_(run, data);
-    if (row) statRows.push(row);
+    const route = statRouteOfRun_(run, data);                 // renual P5
+    if (route === 'book') { excludedRuns++; continue; }
+    const row = route === '22' ? statBuildStatRow_(run, data, statCfg22_()) : statBuildStatRow_(run, data);
+    if (row) (route === '22' ? statRows22 : statRows).push(row);
     else skippedRuns++;
   }
+  if (statRows22.length && !dst22) return fail(`'${STAT22.DST_SHEET}' 시트를 찾을 수 없습니다 (신형식 세트 ${statRows22.length}개).`);
 
   // ── 4. Stat 3행 이하 전체 클리어 (2행 함수 보존) ──
   const dstLastRow = dst.getLastRow();
@@ -171,10 +217,11 @@ function stat_core_() {
       STATCONFIG.DST_NUM_COLS
     ).setValues(statRows);
   }
+  if (dst22) statWriteRows_(dst22, statRows22, STAT22.DST_START_ROW, STAT22.DST_NUM_COLS);   // renual P5
   SpreadsheetApp.flush();
 
-  Logger.log(`StatCalc v3: runs=${runs.length}, sets=${statRows.length}, skipped=${skippedRuns}`);
-  return { ok: true, message: '', runs: runs.length, sets: statRows.length, skipped: skippedRuns };
+  Logger.log(`StatCalc v3: runs=${runs.length}, sets=${statRows.length}, sets22=${statRows22.length}, skipped=${skippedRuns}, excluded=${excludedRuns}`);
+  return { ok: true, message: '', runs: runs.length, sets: statRows.length, skipped: skippedRuns, sets22: statRows22.length, excluded: excludedRuns };
 }
 
 
@@ -242,7 +289,23 @@ function statFindSetRuns_(data) {
  * 하나의 연속 구간에 대한 Stat 행(A~Z, 26열) 생성
  * 유효 문항 수가 MIN_SET_SIZE 미만이면 null 반환
  */
-function statBuildStatRow_(run, data) {
+/** renual P5: Stat(22) 행 만들기 설정 */
+function statCfg22_() {
+  const totalKeys = {};
+  STAT22.GROUPS.forEach(g => g.keys.forEach(k => { totalKeys[k] = true; }));
+  return { MIN_SET_SIZE: STAT22.MIN_SET_SIZE, DST_NUM_COLS: STAT22.DST_NUM_COLS, GROUPS: STAT22.GROUPS, TOTAL_IDX: STAT22.TOTAL_COL - 1, totalKeys: totalKeys };
+}
+
+/** renual P5: 3행 이하 비우고 기록 (2행 함수 보존) — 옛 Stat 의 4·5 단계와 같은 방식 */
+function statWriteRows_(dst, rows, startRow, numCols) {
+  const last = dst.getLastRow();
+  if (last >= startRow) dst.getRange(startRow, 1, last - startRow + 1, numCols).clearContent();
+  if (rows.length) dst.getRange(startRow, 1, rows.length, numCols).setValues(rows);
+}
+
+function statBuildStatRow_(run, data, cfg) {
+  cfg = cfg || { MIN_SET_SIZE: STATCONFIG.MIN_SET_SIZE, DST_NUM_COLS: STATCONFIG.DST_NUM_COLS, GROUPS: STATCONFIG.GROUPS,
+                 TOTAL_IDX: 25, totalKeys: null };            // renual P5: 기본 = 옛 Stat (지금과 같음)
   const C = STATCONFIG.SRC_COL;
   const TOK_IDX   = C.TOKENS - 1;   // S = index 18
   const MODEL_IDX = C.MODEL  - 1;   // T = index 19
@@ -266,10 +329,10 @@ function statBuildStatRow_(run, data) {
   }
 
   // ── 세트 인정 기준 (사양 ①⑤: 유효 행 기준 38개 이상) ──
-  if (validRows.length < STATCONFIG.MIN_SET_SIZE) return null;
+  if (validRows.length < cfg.MIN_SET_SIZE) return null;
 
   // ── 기본 정보 ──
-  const out = new Array(STATCONFIG.DST_NUM_COLS).fill('');
+  const out = new Array(cfg.DST_NUM_COLS).fill('');
   out[0] = run.setName;               // A 세트명
   out[1] = run.startIdx + 2;          // B 시작 행번호 (Stack 실제 행)
   out[2] = run.endIdx + 2;            // C 끝 행번호
@@ -278,7 +341,7 @@ function statBuildStatRow_(run, data) {
          : models[0] + ' 외';
 
   // ── 그룹별 평균 (사양 ④: 정수 반올림 / 사양 ⑦: 완전 일치) ──
-  for (const g of STATCONFIG.GROUPS) {
+  for (const g of cfg.GROUPS) {
     let sum = 0, cnt = 0;
     for (const r of validRows) {
       if (g.keys.indexOf(r.group) !== -1) {
@@ -290,12 +353,12 @@ function statBuildStatRow_(run, data) {
   }
 
   // ── Z열: 토큰 총합 (v2: E~T열 그룹 = 공통+확통+미적만 포함) ──
-  const totalKeys = statBuildTotalKeySet_();
+  const totalKeys = cfg.totalKeys || statBuildTotalKeySet_();
   let total = 0;
   for (const r of validRows) {
     if (totalKeys[r.group]) total += r.tokens;
   }
-  out[25] = total;
+  out[cfg.TOTAL_IDX] = total;
 
   return out;
 }
