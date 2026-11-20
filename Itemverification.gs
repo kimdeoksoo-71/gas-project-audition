@@ -341,6 +341,8 @@ function processVerificationQueue() {
     let rowImgs = null;   // 패치 13: 이 행에서 마지막으로 수집한 그림 정보 (Y열 기록용)
 
     try {
+      const scope = sc_scopeForRow_(sheet, currentRow, row[0]);   // renual §9-5: 교육과정 범위
+      const scPm  = sc_prompts_();
       // 상태 표시
       sheet.getRange(currentRow, VCONFIG.COL.P_NOTE).setValue(
         `검증중... [${i + 1}/${batchSize}]`
@@ -363,7 +365,7 @@ function processVerificationQueue() {
 
         // v3: 남은 시간의 절반을 STEP 1 예산으로
         const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / 2;
-        const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget, imgs1);
+        const pResult = callGeminiWithRetry_(sc_system_(pPrompts.system, 1, scope, scPm), sc_user_(userContent, scope, scPm), pPrompts.assistant, stepBudget, imgs1);
         totalApiTime += (Date.now() - t1);
 
         // v4: 성공 시 연속 503 카운터 리셋
@@ -395,6 +397,7 @@ function processVerificationQueue() {
       if (solution === '') {
         sheet.getRange(currentRow, VCONFIG.COL.S_VERDICT, 1, 2)
           .setValues([['SKIP', 'C열(풀이) 비어있음']]);
+        sc_writeFit_(sheet, currentRow, null, scope);   // renual §7.2: 해설 없음 → AE·AF 비움
       } else {
         const t2 = Date.now();
         const imgs2 = iv_imageParts_([stem, solution]);             // 패치 12·13
@@ -405,7 +408,7 @@ function processVerificationQueue() {
 
         // v3: 남은 시간 전체를 STEP 2 예산으로
         const stepBudget = VCONFIG.MAX_EXEC_MS - (Date.now() - startTime);
-        const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget, imgs2);
+        const sResult = callGeminiWithRetry_(sc_system_(sPrompts.system, 2, scope, scPm), sc_user_(userContent2, scope, scPm), sPrompts.assistant, stepBudget, imgs2);
         totalApiTime += (Date.now() - t2);
 
         // v4: 성공 시 연속 503 카운터 리셋
@@ -416,6 +419,7 @@ function processVerificationQueue() {
 
         sheet.getRange(currentRow, VCONFIG.COL.S_VERDICT, 1, 2)
           .setValues([[sVerdict, sError]]);
+        sc_writeFit_(sheet, currentRow, sResult, scope);   // renual §7.2: 교육과정 부합 AE·AF
       }
 
       // ── 패치 13: Y열(fig_info)에 그림 첨부/누락 내역 기록 ──
@@ -505,6 +509,9 @@ function testSingleRowVerification() {
 
   const pPrompts = getPromptSet('gemini_problem_verify');
   const sPrompts = getPromptSet('gemini_solution_verify');
+  const scope = sc_scopeForRow_(sheet, rowNum);   // renual §9-5
+  const scPm  = sc_prompts_();
+  Logger.log(`범위: ${scope.curr || '없음'}${scope.line.replace(/\n/g, ' ')}`);
 
   try {
     // ── 문제 검증 ──
@@ -518,7 +525,7 @@ function testSingleRowVerification() {
 
       const t1 = Date.now();
       // 단일 행 테스트는 충분한 예산(3분) 부여
-      const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, 180000, imgsT1);   // 패치 12
+      const pResult = callGeminiWithRetry_(sc_system_(pPrompts.system, 1, scope, scPm), sc_user_(userContent, scope, scPm), pPrompts.assistant, 180000, imgsT1);   // 패치 12 · renual §9-5
       Logger.log(`문제검증 (${Date.now() - t1}ms): ${JSON.stringify(pResult)}`);
 
       sheet.getRange(rowNum, VCONFIG.COL.P_VERDICT, 1, 3).setValues([[
@@ -546,16 +553,18 @@ function testSingleRowVerification() {
         .replace(/\{solution\}/g, solution) + iv_imageNote_(imgsT2);
 
       const t2 = Date.now();
-      const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, 180000, imgsT2);   // 패치 12
+      const sResult = callGeminiWithRetry_(sc_system_(sPrompts.system, 2, scope, scPm), sc_user_(userContent2, scope, scPm), sPrompts.assistant, 180000, imgsT2);   // 패치 12 · renual §9-5
       Logger.log(`해설검증 (${Date.now() - t2}ms): ${JSON.stringify(sResult)}`);
 
       sheet.getRange(rowNum, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
         String(sResult.verdict || 'error').toLowerCase(),
         `[TEST] ${String(sResult.error_report || '')}`
       ]]);
+      sc_writeFit_(sheet, rowNum, sResult, scope);   // renual §7.2
     } else {
       sheet.getRange(rowNum, VCONFIG.COL.S_VERDICT, 1, 2)
         .setValues([['SKIP', 'C열(풀이) 비어있음']]);
+      sc_writeFit_(sheet, rowNum, null, scope);
     }
 
     ui.alert(`행 ${rowNum} 테스트 완료. 로그를 확인하세요.`);
@@ -1286,6 +1295,8 @@ function extractFieldsByRegex_(text) {
     derived_answer: derived || '',
     solution_note: note || '',
     error_report: errRpt || '',
+    curriculum_fit: getField('curriculum_fit'),     // renual §7.2
+    curriculum_note: getField('curriculum_note'),
   };
 
   Logger.log('[extractFieldsByRegex_] 추출 결과: verdict=' + verdict);
@@ -1598,6 +1609,8 @@ function retryErrorRows() {
       const stem       = String(sheet.getRange(t.row, VCONFIG.COL.STEM).getValue() || '').trim();
       const solution   = String(sheet.getRange(t.row, VCONFIG.COL.SOLUTION).getValue() || '').trim();
       const answerType = String(sheet.getRange(t.row, VCONFIG.COL.ANSWER_TYPE).getValue() || '').trim();
+      const scope = sc_scopeForRow_(sheet, t.row);   // renual §9-5
+      const scPm  = sc_prompts_();
 
       // ── STEP 1: 문제 검증 (필요 시) ──
       if (t.retryProblem) {
@@ -1616,7 +1629,7 @@ function retryErrorRows() {
           // STEP 1에 남은 시간의 절반 할당 (둘 다 재시도면)
           const split = (t.retryProblem && t.retrySolution) ? 2 : 1;
           const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / split;
-          const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, stepBudget, imgsR1);
+          const pResult = callGeminiWithRetry_(sc_system_(pPrompts.system, 1, scope, scPm), sc_user_(userContent, scope, scPm), pPrompts.assistant, stepBudget, imgsR1);
 
           sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3).setValues([[
             String(pResult.verdict || 'error').toLowerCase(),
@@ -1643,6 +1656,7 @@ function retryErrorRows() {
         if (solution === '') {
           sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2)
             .setValues([['SKIP', 'C열(풀이) 비어있음']]);
+          sc_writeFit_(sheet, t.row, null, scope);
         } else {
           const imgsR2 = iv_imageParts_([stem, solution]);          // 패치 12·13
           sheet.getRange(t.row, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(imgsR2));
@@ -1651,12 +1665,13 @@ function retryErrorRows() {
             .replace(/\{solution\}/g, solution) + iv_imageNote_(imgsR2);
 
           const stepBudget = (VCONFIG.MAX_EXEC_MS - (Date.now() - startTime)) / (t.retryQuality ? 2 : 1);
-          const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, stepBudget, imgsR2);
+          const sResult = callGeminiWithRetry_(sc_system_(sPrompts.system, 2, scope, scPm), sc_user_(userContent2, scope, scPm), sPrompts.assistant, stepBudget, imgsR2);
 
           sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
             String(sResult.verdict || 'error').toLowerCase(),
             String(sResult.error_report || '').trim(),
           ]]);
+          sc_writeFit_(sheet, t.row, sResult, scope);   // renual §7.2
         }
       }
 

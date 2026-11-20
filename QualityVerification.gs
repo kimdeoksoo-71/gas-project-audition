@@ -308,7 +308,7 @@ function loadQualityPrompts_() {
   const gem   = getPromptSet('gemini_quality_verify');
   const judge = getPromptSet('claude_quality_judge');
   if (!gem.system || !gem.user || !judge.system || !judge.user) return null;
-  return { gem: gem, judge: judge };
+  return sc_addRule34_({ gem: gem, judge: judge }, sc_prompts_());   // renual §9-5: 범위만을 이유로 결함 후보·판정 안 함
 }
 
 
@@ -563,7 +563,7 @@ function loadGarbagePrompts_() {
   const gem   = getPromptSet('gemini_garbage_verify');
   const judge = getPromptSet('claude_garbage_judge');
   if (!gem.system || !gem.user || !judge.system || !judge.user) return null;
-  return { gem: gem, judge: judge };
+  return sc_addRule34_({ gem: gem, judge: judge }, sc_prompts_());   // renual §9-5: 범위만을 이유로 결함 후보·판정 안 함
 }
 
 /**

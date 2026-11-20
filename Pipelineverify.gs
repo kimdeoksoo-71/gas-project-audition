@@ -881,6 +881,8 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
     const stem       = String(sheet.getRange(t.row, VCONFIG.COL.STEM).getValue() || '').trim();
     const solution   = String(sheet.getRange(t.row, VCONFIG.COL.SOLUTION).getValue() || '').trim();
     const answerType = String(sheet.getRange(t.row, VCONFIG.COL.ANSWER_TYPE).getValue() || '').trim();
+    const scope = sc_scopeForRow_(sheet, t.row);   // renual §9-5: 교육과정 범위
+    const scPm  = sc_prompts_();
 
     // ── STEP 1 ──
     if (t.retryProblem) {
@@ -899,7 +901,7 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
 
         const split = (t.retryProblem && t.retrySolution) ? 2 : 1;
         const budget = Math.max((deadline - Date.now()) / split, VCONFIG.API_CALL_RESERVE_MS);
-        const pResult = callGeminiWithRetry_(pPrompts.system, userContent, pPrompts.assistant, budget, imgsP1);
+        const pResult = callGeminiWithRetry_(sc_system_(pPrompts.system, 1, scope, scPm), sc_user_(userContent, scope, scPm), pPrompts.assistant, budget, imgsP1);
 
         sheet.getRange(t.row, VCONFIG.COL.P_VERDICT, 1, 3).setValues([[
           String(pResult.verdict || 'error').toLowerCase(),
@@ -920,6 +922,7 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
       if (solution === '') {
         sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2)
           .setValues([['SKIP', 'C열(풀이) 비어있음']]);
+        sc_writeFit_(sheet, t.row, null, scope);
       } else {
         const imgsP2 = iv_imageParts_([stem, solution]);             // 패치 13: 그림 첨부
         sheet.getRange(t.row, VCONFIG.COL_FIG_INFO).setValue(iv_figInfo_(imgsP2));
@@ -928,12 +931,13 @@ function pv_retryRow_(sheet, t, pPrompts, sPrompts, deadline) {
           .replace(/\{solution\}/g, function () { return solution; }) + iv_imageNote_(imgsP2);
 
         const budget = Math.max(deadline - Date.now(), VCONFIG.API_CALL_RESERVE_MS);
-        const sResult = callGeminiWithRetry_(sPrompts.system, userContent2, sPrompts.assistant, budget, imgsP2);
+        const sResult = callGeminiWithRetry_(sc_system_(sPrompts.system, 2, scope, scPm), sc_user_(userContent2, scope, scPm), sPrompts.assistant, budget, imgsP2);
 
         sheet.getRange(t.row, VCONFIG.COL.S_VERDICT, 1, 2).setValues([[
           String(sResult.verdict || 'error').toLowerCase(),
           lw_wrapBareMath_(String(sResult.error_report || '').trim()),
         ]]);
+        sc_writeFit_(sheet, t.row, sResult, scope);   // renual §7.2: 교육과정 부합 AE·AF
       }
     }
   } catch (e) {
